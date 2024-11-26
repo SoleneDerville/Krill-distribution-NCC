@@ -1,0 +1,570 @@
+---
+title: "Environmental Data for Krill SDM"
+author: "Solene Derville"
+date: "`r format(Sys.time(), '%d %B, %Y, %H:%M')`"
+output: 
+   html_document:
+    highlight: pygments
+    keep_md: false
+    number_sections: true
+    toc: true
+    toc_float:
+      collapsed: false
+---
+
+```{r, echo=F, result="hide", include=F}
+lib=lapply(c("plyr","readxl","raster","stars", "sf", "viridis", "ggthemes", "patchwork", "ncdf4","doParallel", "foreach", "tidyverse", "lubridate", "corrplot", "data.table"), library, character.only=T)
+
+mon_theme <- theme(
+        panel.border = element_rect(linewidth=0.5,color="black", fill="transparent"),
+        plot.margin=unit(c(2,2,2,2),"mm"),
+        panel.background = element_rect(fill = 'white'),
+        text=element_text(face="bold", size=8),
+        title = element_text(size=rel(1.2)))
+
+Sys.setenv(TZ = "America/Los_Angeles")
+```
+
+Echosounder NASC krill data
+```{r}
+load("../1-Krill_aggregate/Outputs/krill_df.RData")
+```
+
+Bongo biomass krill data
+```{r}
+## from NCC cruises
+bongo_df <- readxl::read_excel("../Data/Biomass/NCC_Krill_Density_Biomass_2018-2022_updated_Nov9_2023_USE_THIS_ONE.xlsx") %>% 
+  mutate(time = as.POSIXct(`Sample Date`)) %>% 
+  mutate(Date_M = paste0(substr(as.character(time), 1, 4),
+                        substr(as.character(time), 6, 7),
+                        substr(as.character(time), 9, 10))) %>% 
+  select(Date_M, time)
+
+## from NH Line
+bongo_nhl_df <- readxl::read_excel("../Data/Biomass/NHL_krill_biomass_2018-2022_sum_LH_w_LatLon.xlsx") %>% 
+  mutate(time = as.POSIXct(`Sample Date`)) %>% 
+  mutate(Date_M = paste0(substr(as.character(time), 1, 4),
+                        substr(as.character(time), 6, 7),
+                        substr(as.character(time), 9, 10))) %>% 
+  select(Date_M, time)
+```
+
+
+Extent of training area
+```{r}
+extent_study_area <-  extent(-129, -122.3, 37.5, 48.4)
+```
+
+Topography
+```{r}
+## shapefiles
+coast_sf <- st_read("../Data/Environment/coast_openstreetmap_WA-OR-CA.shp")
+coast_sf_utm <- st_transform(coast_sf, crs = 32610)
+
+# load manually "simplified" coastline made on QGIS from which I removed the bays/estuaries excluded from analysis
+coast_simplified <- st_read("../Data/Environment/coast_simplified_WA-OR-CA.shp", crs = 4326) %>% 
+  st_transform(crs = 32610) %>%
+  filter(!st_is_empty(.))
+
+## rasters
+load("../Data/Environment/env_stack.RData")
+```
+
+# Days and weeks to extract
+
+Define all days at which to download data = the days of surveys and 6 days prior + the last day of the third week of each month and preceding 4 weeks for predictions
+```{r}
+###################
+####### SURVEY DAYS
+# combine survey days from echosounder (krill_df) and bongo data (bongo_df)
+krill_dates_df <- krill_df %>% 
+  rename(time = time_GMT) %>% 
+  select(Date_M, time) %>% 
+  as.data.frame() %>% 
+  select(-geometry) %>% 
+  rbind(bongo_df) %>% 
+  rbind(bongo_nhl_df)
+
+count <- 0
+days_data_gmt <- ddply(krill_dates_df, ~Date_M, function(d){
+  count <<- count + 1
+  return(data.frame(type = "survey",
+             chunk = paste0("surv_", count),
+             target_days = rep(substr(as.character(d$time[1]), 1, 10), 7), # day of survey and 6 days prior (total of 7 days)
+             week_days = substr(as.character(d$time[1]-seq(0, 6, 1)*3600*24), 1, 10)))
+})
+
+# convert to raster layer format for dates
+days_data_gmt$target_days_ras <- paste("X", substr(days_data_gmt$target_days, 1, 4), ".",
+                      as.numeric(substr(days_data_gmt$target_days, 6, 7)), ".",
+                      as.numeric(substr(days_data_gmt$target_days, 9, 10)), sep = "")
+
+days_data_gmt$week_days_ras <- paste("X", substr(days_data_gmt$week_days, 1, 4), ".",
+                      as.numeric(substr(days_data_gmt$week_days, 6, 7)), ".",
+                      as.numeric(substr(days_data_gmt$week_days, 9, 10)), sep = "")
+
+n_distinct(days_data_gmt$chunk)
+n_distinct(days_data_gmt$target_days) # number of days or survey or target days of prediction
+n_distinct(days_data_gmt$week_days) # associate 6 days prior to target day
+```
+
+# Define functions
+```{r}
+#####################
+### Convert matrices to rasters
+Fun_formatROMS <- function(var_mat){
+  r <- t(flip(brick(var_mat, ymn = extent_study_area[1], 
+                       ymx = extent_study_area[2], 
+                       xmn = extent_study_area[3], 
+                       xmx = extent_study_area[4]), direction = "x"))
+  proj4string(r) <- "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs"
+  names(r) <- names_selected_days
+  return(r)
+}
+
+
+####################
+### Calculate spatial standard deviation
+Fun_sdROMS <- function(var_mat){
+  day_ras <- list()
+  for(k in c(1: dim(var_mat)[3])){
+    r <- t(flip(raster(var_mat[,,k], ymn = extent_study_area[1], 
+                       ymx = extent_study_area[2], 
+                       xmn = extent_study_area[3], 
+                       xmx = extent_study_area[4]), direction = "x"))
+    r <- focal(r, w=matrix(1, ncol=3, nrow=3), 
+             pad=T, fun=function(x) sd(x, na.rm=T))
+    day_ras <- c(day_ras, list(r))
+  }
+  day_ras <- stack(day_ras)
+  proj4string(day_ras) <- "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs"
+  names(day_ras) <- names_selected_days
+  return(day_ras)
+}
+
+##################
+# function created to extract specific days (days_selec) from the var_day raster stack. daily rasters are averaged on a weekly scale. If type == "survey" the function returns a raster from the week prior to the target day in days_selec. If type == "pred" the function returns 4 rasters from the 4 weeks prior to the target day.
+Fun_RASweekly <- function(var_day, days_selec, type){
+  if(type == "survey"){
+    days_selec <- days_selec %>% filter(type == "survey")
+    output_list <- dlply(days_selec, ~chunk, function(d){ # for each target day
+      if(all(d$target_days_ras %in% names(var_day))){
+        mean(var_day[[d$week_days_ras]], na.rm = T)
+      }
+    })
+    # remove empty list elements if data was not available
+    output_list <- output_list %>% keep( ~ !is.null(.) )
+    # stack back the list of rasters
+    output_stack <- stack(output_list)
+    # quick and dirty renaming
+    for(i in 1:length(names(output_stack))){
+        newname <- days_selec[days_selec$chunk == names(output_stack)[i], ]$target_days_ras[1]
+        names(output_stack)[i] <- newname
+    }
+    return(output_stack)
+  }
+  if(type == "pred"){
+    days_selec <- days_selec %>% filter(type == "pred")
+    output_list <- dlply(days_selec, ~chunk, function(d){ # for each target day and 28 days prior
+      month_list <- list() # will contain 4 rasters for each week
+      for(i in seq(1, 28, 7)){ #select the first day of each of the 4 weeks included in d    
+        one_week <- d$week_days_ras[i:(i+6)]
+        if(all(one_week %in% names(var_day))){
+          r <- mean(var_day[[one_week]], na.rm = T) # week average to be returned in list
+          names(r) <- paste0("X", i, d$target_days_ras[1]) # the name of the layer is the target day and the number of days prior to this date
+          month_list <- c(month_list, list(r))
+        }
+      }
+      return(month_list)
+    })
+    # remove empty list elements if data was not available
+    output_list <- output_list %>% keep( ~ !is.null(.) )
+    # unlist
+    output_list <- unlist(output_list)
+    # rename elements in list will result in stack layer names being the right ones
+    for (i in 1:length(output_list)){
+      names(output_list)[i] <- names(output_list[[i]])[1]
+    }
+    # stack back the list of rasters
+    output_stack <- stack(output_list)
+    return(output_stack)
+  }
+}
+
+# function to extract environmental data at specific times and positions. If the value is NA, the function calculates the mean within a 15 km buffer
+Fun_extract_dynamic <- function(dataset, env){
+  final <- ddply(dataset, ~date_raster_week, function(d){ # for each date in the data
+    # duplicate dataframe
+    dd <- d
+    # extract variables at the right date from each of the varname elements in env
+    # this loop is not returning anything but rather directly writting new columns into dd
+    env %>% 
+      mutate(temp_extract = map2(.x = varname, .y = survey_ras, function(x, y){
+        if(length(which(names(y) == d$date_raster_week[1])) != 0){ # if the layer actually exist in the raster data
+              suppressWarnings(dd[x] <<- c(raster::extract(y, d[c("utmx", "utmy")], # suppress warnings because just due to attempt to find the minimum or maximum value of a vector that has a length of zero
+              layer = which(names(y) == d$date_raster_week[1]),
+              nl = 1))) # get the relevant layer and extract
+        } else { dd[x] <<- NA}
+      }))
+    return(dd)
+  })
+  
+  # work on points with NA
+  final_nona <- final[complete.cases(final[env$varname]), ]
+  final_na <- final[!complete.cases(final[env$varname]), ]
+  final_na_corrected <- ddply(final_na, ~date_raster_week, function(d){ # for each month in the data
+    for (i in 1:nrow(d)){ # for each point
+      for (j in env$varname){ # for each variable
+        r <- env %>% filter(varname == j) %>% pull(survey_ras)
+        env_layer_index = which(names(r) == d$date_raster_week[1])
+        # if the variable extracted at the point is NA and there is actually an env layer for that day
+        if(is.na(d[i,j]) & length(env_layer_index) != 0){ 
+          suppressWarnings(d[i,j] <- c(raster::extract(r[[1]], 
+              d[i, c("utmx", "utmy")], 
+              layer = env_layer_index,
+              nl = 1,
+              buffer = 15000,
+              fun = function(x) mean(x, na.rm = T)))) # get the data in a 15 km buffer
+        }
+      }
+    }
+    return(d)
+  })
+  # join the two dataframes
+  if(nrow(final_na_corrected) > 0){
+    final_na_corrected$extrapol <- 1
+  } else {final_na_corrected <- cbind(final_na_corrected, 
+                                      data.frame(extrapol = numeric(0)))}
+  final_nona$extrapol <- 0
+  final <- rbind(final_na_corrected, final_nona)
+  return(final)
+}
+
+```
+
+# ROMS layers
+
+ROMS layers were downloaded with netcdf THREDDS from 2015-12-26 to 2021-09-29 (OPAL model training), and later from 2011-01-02 to 2015-12-25 (model predictions for OPAL paper 2). Now the ROMS netcdf download tool does not work anymore so the work around is to download daily layers by variable in matlab and save as daily matrices.
+```{r}
+# finding the date to start the new download from roms on September 2021
+start_roms <- as.POSIXct("2011.01.02 00:00:00", format = "%Y.%m.%d %H:%M:%S", "GMT")
+end_roms <- as.POSIXct("2021.09.29 00:00:00", format = "%Y.%m.%d %H:%M:%S", tz = "GMT")
+difftime(start_roms, end_roms, units = "days")
+```
+
+Data prior to 2021-09-29
+```{r, eval = T}
+roms2016_2021 <- nc_open("../../../../Data/Environment/UCSC/CCSRA_2016a_Phys_ROMS_Derived_Variables_Aggregation_best.ncd.nc")
+
+# time dimension in roms
+time_roms <- ncvar_get(roms2016_2021, varid = "time")
+time_roms <- as.POSIXct(time_roms*3600, origin = "2011-01-02 00:00:00", tz = "GMT")
+time_roms <- paste0("X", year(time_roms), ".", month(time_roms), ".", day(time_roms))
+
+# select only the right daily layers in the roms matrices
+# the indices along the time dimension of the matrices
+selected_days <- which(time_roms %in% unique(days_data_gmt$week_days_ras))
+# and the actual name of the day in the roms data
+names_selected_days <- time_roms[time_roms %in% unique(days_data_gmt$week_days_ras)]
+
+### load rasters as matrices
+roms_data <- tibble(varname = c("ssh", "sst", "ild_05", "bbv_200", "curl", "su", "sv")) %>% 
+  mutate(mat = map(varname,
+       ~ ncvar_get(roms2016_2021, varid = .)[,,selected_days]))
+
+### format matrix to rasters
+roms_data <- roms_data %>%
+    mutate(rasters = map(mat, function(m) Fun_formatROMS(var_mat = m)))
+
+### calculate SSTSD and SSHSD rasters
+roms_data_sd <- roms_data %>%
+  filter(varname == "ssh" | varname == "sst") %>% 
+  mutate(varname = case_when(varname == "sst" ~ "sstsd",
+                             varname == "ssh" ~ "sshsd")) %>% 
+  mutate(rasters = map(mat, function(m) Fun_sdROMS(var_mat = m)))
+roms_data <- rbind(roms_data, roms_data_sd)
+
+### calculate eke per day
+roms_data_eke <- tibble(varname = "eke",
+                        mat = NA) %>% 
+  mutate(rasters = map(varname, function(v){
+    su_mat <- roms_data %>% filter(varname == "su") %>% pluck("mat", 1)
+    sv_mat <- roms_data %>% filter(varname == "sv") %>% pluck("mat", 1)
+    days 
+    eke_roms_day <- list()
+    for(k in c(1:dim(su_mat)[3])){
+    # su and sv are not on the same grid
+    # use michael jacox's approach
+    su_mat_new <- (su_mat[,-seq_len(1),k] + su_mat[,-1,k])/2
+    sv_mat_new <- (sv_mat[-seq_len(1),,k] + sv_mat[-1,,k])/2
+    # then provide coordinates and flip into a raster
+    u_r <- t(flip(raster(su_mat_new, ymn = extent_study_area[1], 
+                           ymx = extent_study_area[2], 
+                           xmn = extent_study_area[3], 
+                           xmx = extent_study_area[4]), direction = "x"))
+    v_r <- t(flip(raster(sv_mat_new, ymn = extent_study_area[1], 
+                           ymx = extent_study_area[2], 
+                           xmn = extent_study_area[3], 
+                           xmx = extent_study_area[4]), direction = "x"))
+
+    eke_r <- (u_r^2 + v_r^2)/2
+    eke_roms_day <- c(eke_roms_day, list(eke_r))
+  }
+  eke_roms_day <- stack(eke_roms_day)
+  proj4string(eke_roms_day) <- "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs"
+
+  # need to log10 transform (Cimino et al. 2020)
+  eke_roms_day <- calc(eke_roms_day, function(x) log10(x + 0.01))
+  # rename layers
+  names(eke_roms_day) <- names_selected_days
+  return(eke_roms_day)
+  }))
+
+roms_data <- rbind(roms_data, roms_data_eke)
+save(roms_data, file = "./Outputs/roms_data_prior20210929.RData")
+```
+
+Data posterior to 2021-09-29
+```{r, eval = T}
+load("./Outputs/roms_data_prior20210929.RData")
+# select days > sep 2021
+names_selected_days_new <- unique(days_data_gmt[!days_data_gmt$week_days_ras %in% time_roms, ]$week_days_ras)
+# time reference for these days in the roms matlab derived dataset
+selected_days_new <- as.POSIXct(paste(names_selected_days_new, "00:00:00"), format = "X%Y.%m.%d %H:%M:%S", tz = "GMT")
+selected_days_new <- as.numeric(difftime(selected_days_new, start_roms, units = "day"))
+
+### load rasters as matrices
+roms_data_updated <- roms_data %>% 
+  mutate(rasters = map2(.x = varname, .y = rasters, function(x, y){
+    if (x != "sshsd" & x != "sstsd" & x != "eke"){
+      for(i in c(1:length(selected_days_new))){
+        # I have to do a weird str_split of the name of the folder for bbv_200 and ild_05 because somehow having a number in the folder name prevents fread (or read.csv) to access the files inside it
+        var_mat <- fread(paste0("../../../../Data/Environment/UCSC/2023newdownload/", str_split_i(x ,"_", 1), "_newROMS_OPALarea_Sep21_present/", 
+                         x, "_newROMS_OPALarea_Sep21_present_", selected_days_new[i],".csv")) %>% 
+                 as.matrix()
+        r <- t(flip(raster(var_mat, ymn = extent_study_area[1], 
+                       ymx = extent_study_area[2], 
+                       xmn = extent_study_area[3], 
+                       xmx = extent_study_area[4]), direction = "x"))
+        proj4string(r) <- "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs"
+        names(r) <- names_selected_days_new[i]
+        y <- stack(y, r)
+      }
+    }
+    if (x == "sshsd" | x == "sstsd"){
+      for(i in c(1:length(selected_days_new))){
+        var_mat <- fread(paste0("../../../../Data/Environment/UCSC/2023newdownload/", substr(x ,1, 3),
+                                "_newROMS_OPALarea_Sep21_present/", 
+                         substr(x ,1, 3), "_newROMS_OPALarea_Sep21_present_", selected_days_new[i],".csv")) %>% 
+                 as.matrix()
+        r <- t(flip(raster(var_mat, ymn = extent_study_area[1], 
+                       ymx = extent_study_area[2], 
+                       xmn = extent_study_area[3], 
+                       xmx = extent_study_area[4]), direction = "x"))
+        r <- focal(r, w=matrix(1, ncol=3, nrow=3), 
+              pad=T, fun=function(x) sd(x, na.rm=T))
+        proj4string(r) <- "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs"
+        names(r) <- names_selected_days_new[i]
+        y <- stack(y, r)
+      }
+    }
+    if (x == "eke"){
+      for(i in c(1:length(selected_days_new))){
+        su_mat <- fread(paste0("../../../../Data/Environment/UCSC/2023newdownload/su_newROMS_OPALarea_Sep21_present/su_newROMS_OPALarea_Sep21_present_", selected_days_new[i],".csv")) %>% 
+                 as.matrix()
+        sv_mat <- fread(paste0("../../../../Data/Environment/UCSC/2023newdownload/sv_newROMS_OPALarea_Sep21_present/sv_newROMS_OPALarea_Sep21_present_", selected_days_new[i],".csv")) %>% 
+                 as.matrix()
+        # tweak the dimensions of the matrices to align them
+        su_mat_new <- (su_mat[,-seq_len(1)] + su_mat[,-1])/2
+        sv_mat_new <- (sv_mat[-seq_len(1),] + sv_mat[-1,])/2
+        # then provide coordinates and flip into a raster
+        u_r <- t(flip(raster(su_mat_new, ymn = extent_study_area[1], 
+                           ymx = extent_study_area[2], 
+                           xmn = extent_study_area[3], 
+                           xmx = extent_study_area[4]), direction = "x"))
+        v_r <- t(flip(raster(sv_mat_new, ymn = extent_study_area[1], 
+                           ymx = extent_study_area[2], 
+                           xmn = extent_study_area[3], 
+                           xmx = extent_study_area[4]), direction = "x"))
+
+        eke_r <- (u_r^2 + v_r^2)/2
+        # need to log10 transform (Cimino et al. 2020)
+        eke_r <- calc(eke_r, function(x) log10(x + 0.01))
+        proj4string(eke_r) <- "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs"
+        names(eke_r) <- names_selected_days_new[i]
+        y <- stack(y, eke_r)
+      }
+    }
+    return(y)
+  }))
+```
+
+```{r, eval = T}
+### extractions and averaging over weeks prior to day of interest
+roms_data_updated <- roms_data_updated %>% 
+  mutate(survey_ras = map(rasters, function(r) 
+    Fun_RASweekly(r, days_data_gmt, type = "survey")))
+
+### project to UTM
+roms_data_updated <- roms_data_updated %>% 
+  mutate(survey_ras = map2(.x = varname, .y = survey_ras, function(x, y) {
+    projectRaster(y, crs = "+proj=utm +zone=10 +north +ellps=WGS84 +datum=WGS84 +units=m +no_defs",
+                  filename = paste0("./Outputs/ras_source/survey_ras", x, ".grd"), overwrite = T)}))
+
+save(roms_data_updated, file = "./Outputs/roms_data_updated.RData")
+```
+
+
+```{r}
+load("./Outputs/roms_data_updated.RData")
+#plot examples of ild
+spplot(roms_data_updated$survey_ras[[3]][[c("X2022.5.10","X2020.3.15", "X2018.9.21")]])
+#plot examples of sshsd
+spplot(roms_data_updated$survey_ras[[8]][[c("X2022.5.10","X2020.3.15", "X2018.9.21")]])
+#plot examples of eke
+spplot(roms_data_updated$survey_ras[[10]][[c("X2022.5.10","X2020.3.15", "X2018.9.21")]])
+```
+
+# Environment extraction
+
+## Prepare aggregated NASC dataframe
+```{r}
+# just getting a grid out of a randomly picked env pred stack for predictions
+load("../Data/Environment/env_pred_full.RData")
+grid <- env_pred_full$env_ras[[1]]$data_pred[[1]][["DEPTH"]]
+rm(env_pred_full)
+```
+
+```{r, eval = T}
+# aggregating krill as averages in 5 km resolution grid
+krill_agg_df <- ddply(as.data.frame(krill_df), .(Date_M, phase), function(d){
+  # set back to sf object now because it will not work as input to the loop
+  d <- st_as_sf(d)
+  # rasterize averaging NASC within 5 km cells
+  s <- raster::rasterize(x = st_coordinates(d), y = grid, 
+                         field = d$NASC, 
+                         fun = mean, 
+                         background = NA)
+
+  # convert back to points and remove zeros
+  p <- st_as_sf(st_as_stars(s), as_points = TRUE) %>% 
+    filter(!is.na(layer)) %>% 
+    rename(nasc = layer)
+  return(p)
+})
+
+summary(krill_agg_df$nasc)
+nrow(krill_agg_df)
+```
+
+## Prepare bongo biomass dataframe
+
+```{r}
+biomass_df <- readxl::read_excel("../Data/Biomass/NCC_Krill_Density_Biomass_2018-2022_updated_Nov9_2023_USE_THIS_ONE.xlsx") %>% 
+  mutate(time = as.POSIXct(`Sample Date`)) %>% 
+  mutate(Date_M = paste0(substr(as.character(time), 1, 4),
+                        substr(as.character(time), 6, 7),
+                        substr(as.character(time), 9, 10)),
+        # create index column to match with raster layer names
+        date_raster_week = paste0("X", substr(Date_M, 1, 4), ".",
+                      as.numeric(substr(Date_M, 5, 6)), ".",
+                      as.numeric(substr(Date_M, 7, 8)))) %>% 
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326) %>% 
+  st_transform(crs = 32610)
+
+biomass_nhl_df <- readxl::read_excel("../Data/Biomass/NHL_krill_biomass_2018-2022_sum_LH_w_LatLon.xlsx") %>% 
+  mutate(time = as.POSIXct(`Sample Date`)) %>% 
+  mutate(Date_M = paste0(substr(as.character(time), 1, 4),
+                        substr(as.character(time), 6, 7),
+                        substr(as.character(time), 9, 10)),
+        # create index column to match with raster layer names
+        date_raster_week = paste0("X", substr(Date_M, 1, 4), ".",
+                      as.numeric(substr(Date_M, 5, 6)), ".",
+                      as.numeric(substr(Date_M, 7, 8)))) %>% 
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326) %>% 
+  st_transform(crs = 32610)
+
+```
+
+## Extract topography
+
+```{r}
+env_stack_5km <- aggregate(env_stack, fact = 10)
+```
+
+
+```{r, eval = T}
+# extract for the nasc data
+krill_agg_df <- krill_agg_df %>%
+  st_as_sf() %>% 
+  cbind(., raster::extract(x = env_stack_5km[[c("DEPTH", "SLOPE", "DIS_SHORE", "DIS_CANYON")]], y = .))
+```
+
+
+```{r}
+# extract for the bongo biomass data
+biomass_df <- biomass_df %>%
+  st_as_sf() %>% 
+  cbind(., raster::extract(x = env_stack_5km[[c("DEPTH", "SLOPE", "DIS_SHORE", "DIS_CANYON")]], y = .))
+
+biomass_nhl_df <- biomass_nhl_df %>%
+  st_as_sf() %>% 
+  cbind(., raster::extract(x = env_stack_5km[[c("DEPTH", "SLOPE", "DIS_SHORE", "DIS_CANYON")]], y = .))
+```
+
+## Extract ROMS variables
+
+```{r}
+env_tb <- roms_data_updated[c("varname", "survey_ras")]
+```
+
+Extract in the nasc krill data
+```{r, eval = T}
+# create index column to match with raster layer names
+krill_agg_df$date_raster_week <- paste("X", substr(krill_agg_df$Date_M, 1, 4), ".",
+                      as.numeric(substr(krill_agg_df$Date_M, 5, 6)), ".",
+                      as.numeric(substr(krill_agg_df$Date_M, 7, 8)), sep = "")
+
+# add utmx and utmy
+krill_agg_df[c("utmx", "utmy")] <- st_coordinates(krill_agg_df)
+
+# extract all dynamic variables
+krill_agg_df <- Fun_extract_dynamic(dataset = krill_agg_df, env = env_tb)
+
+# save
+save(krill_agg_df, file = "./Outputs/krill_agg_df.RData")
+```
+
+Same extract but for the bongo biomass krill data
+```{r}
+# add utmx and utmy
+biomass_df[c("utmx", "utmy")] <- st_coordinates(biomass_df)
+biomass_nhl_df[c("utmx", "utmy")] <- st_coordinates(biomass_nhl_df)
+
+# extract all dynamic variables
+biomass_df <- Fun_extract_dynamic(dataset = biomass_df, env = env_tb)
+biomass_nhl_df <- Fun_extract_dynamic(dataset = biomass_nhl_df, env = env_tb)
+
+# save
+save(biomass_df, file = "./Outputs/biomass_df.RData")
+save(biomass_nhl_df, file = "./Outputs/biomass_nhl_df.RData")
+```
+
+## Cross-correlations
+
+```{r, fig.width = 10}
+load("./Outputs/krill_agg_df.RData")
+
+# vector of environmental variable names
+env_var <- c(env_tb$varname, "DEPTH", "SLOPE", "DIS_SHORE", "DIS_CANYON")
+
+# matrix of correlations
+M <- krill_agg_df %>%
+  dplyr::select(all_of(env_var)) %>%
+  cor(method="pearson", use="pairwise.complete.obs")
+
+# correlation plot
+corrplot(M, method = "number", order = "hclust", tl.cex = 1, cl.cex = 1, type = "lower", diag = F, number.cex = 0.9, addCoefasPercent = T)
+```
+
+

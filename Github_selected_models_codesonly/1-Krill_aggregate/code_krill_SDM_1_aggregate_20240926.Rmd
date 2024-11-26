@@ -1,0 +1,139 @@
+---
+title: "Krill acoustic data processing"
+author: "Solene Derville"
+date: "`r format(Sys.time(), '%d %B, %Y, %H:%M')`"
+output: 
+   html_document:
+    highlight: pygments
+    keep_md: false
+    number_sections: true
+    toc: true
+    toc_float:
+      collapsed: false
+---
+
+```{r, echo=F, result="hide", include=F}
+lib=lapply(c("plyr","officer","readxl","raster","stars", "sf", "viridis", "ggthemes", "patchwork", "tidyverse", "lubridate", "data.table", "suncalc", "mgcv", "gratia"), library, character.only=T)
+
+mon_theme <- theme(
+        panel.border = element_rect(linewidth=0.5,color="black", fill="transparent"),
+        plot.margin=unit(c(2,2,2,2),"mm"),
+        panel.background = element_rect(fill = 'white'),
+        text=element_text(face="bold", size=8),
+        title = element_text(size=rel(1.2)))
+
+Sys.setenv(TZ = "America/Los_Angeles")
+```
+
+Topography
+```{r}
+## shapefiles
+# load manually "simplified" coastline made on QGIS from which bays/estuaries ^were removed
+coast_simplified <- st_read("../Data/Environment/coast_simplified_WA-OR-CA.shp", crs = 4326) %>% 
+  st_transform(crs = 32610) %>%
+  filter(!st_is_empty(.))
+## isobath 1500 m
+iso1500_sf <- st_read("../Data/Environment/iso_sf1500.shp")
+
+## rasters
+load("../Data/Environment/env_stack.RData")
+```
+
+# High resolution NASC
+
+```{r}
+# read csv files
+raw_df <- list.files("../Data/NASC", full.names = T) %>% 
+  ldply(., fread) %>% # trying some data.table functions to speed up the code... and it works damn well
+  data.table()
+
+# remove duplicated rows in case there was some overlap in the echoview export files
+raw_df <- unique(raw_df, by = c("Time_M", "Date_M", "Layer")) 
+
+# remove the surface layers > 30 m
+raw_df <- raw_df[Layer_depth_min >= 30,]
+
+# select columns of interest for a full water column summed analysis
+col <- c("Date_M", "Time_M", "NASC", "Lat_M", "Lon_M")
+sum_df <- raw_df[, ..col] %>% 
+  rename("lat" = "Lat_M", "lon" = "Lon_M") # change names of columns for suncalc package to work
+sum_df
+
+# check NASC values
+summary(sum_df$NASC)
+
+# sum NASC throughout water column
+sum_df <- sum_df[, .(NASC = sum(NASC), nb_depth_layers = length(NASC)), .(Date_M, Time_M, lat, lon)]
+sum_df
+
+# check that the number of layers is consistent with the depth of the echosounder signal (x 10)
+summary(sum_df$nb_depth_layers)
+```
+
+# Environmental covariates
+
+## Day and night
+
+```{r}
+# add date in date format
+sum_df <- sum_df[, date := as.Date(as.character(Date_M), format = "%Y%m%d", tz = "GMT")] #add GMT date as Date
+
+# remove aberrant lon and lat
+sum_df <- sum_df[lon != 999,]
+
+# dataframe is an easier format for suncalc...
+sum_df <- as.data.frame((sum_df))
+sum_df[c("sunrise", "sunset")] <- getSunlightTimes(data = sum_df[,c("date", "lat", "lon")])[c("sunrise", "sunset")]
+
+# categorize in day and night 1 hour before and after sunset (removing data in twilight)
+sum_df <- sum_df %>% 
+  mutate(time_GMT = as.POSIXct(paste(Date_M, Time_M), format = "%Y%m%d %H:%M:%S", tz = "GMT"),
+         phase = case_when(time_GMT > sunrise + 3600 & time_GMT < sunset - 3600 ~ "day",
+                           time_GMT < sunrise - 3600 | time_GMT > sunset + 3600 ~ "night",
+                           (time_GMT >= sunrise - 3600 & time_GMT <= sunrise + 3600) | 
+                           (time_GMT >= sunset - 3600 & time_GMT <= sunset + 3600) ~ "twilight")) %>% 
+  filter(phase != "twilight")
+
+# check out an example for the NCC 2018 May cruise
+ggplot(subset(sum_df, substr(Date_M, 1, 6) == "201805"), aes(lon, lat, col = phase)) +
+  geom_point() +
+  coord_fixed()
+```
+
+
+## Topography
+
+Extract topographic variables from raster stack
+```{r}
+sum_sf <- sum_df %>% 
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) %>% 
+  st_transform(crs = 32610) %>% 
+  cbind(., raster::extract(x = env_stack, y =.))
+```
+
+Categorize data into shelf / slope / open waters
+```{r}
+# shelf up to 200 m, and slope up to 1500 m
+sum_sf <- sum_sf %>% 
+  st_join(iso1500_sf, join = st_intersects) %>% 
+  mutate(habitat = case_when(FID == 0 & DEPTH >= -200 ~ "shelf", 
+                             FID == 0 & DEPTH < -200 ~ "slope",
+                             is.na(FID) ~ "open ocean")) %>% 
+  dplyr::select(-FID)
+```
+
+
+# Output
+
+```{r}
+# remove data collected in inland waters (strait of Juan de Fuca)
+points_to_remove <- sum_sf %>% 
+  st_intersects(coast_simplified, sparse = T)
+
+# do it!
+krill_df <- sum_sf[!(apply(points_to_remove, 1, any)),] 
+
+# save object for next steps
+save(krill_df, file = "./Outputs/krill_df.RData")
+```
+
