@@ -1,0 +1,217 @@
+---
+title: "Krill Species-scaled NASC weekly predictions"
+author: "Solene Derville"
+date: "`r format(Sys.time(), '%d %B, %Y, %H:%M')`"
+output: 
+   html_document:
+    highlight: pygments
+    keep_md: false
+    number_sections: true
+    toc: true
+    toc_float:
+      collapsed: false
+---
+
+# File paths
+```{r, echo=F, result="hide", include=F}
+# open libraries
+lib=lapply(c("plyr","officer","raster","stars", "doParallel", "foreach", 
+             "tidyverse", "lubridate", "mgcv", "gbm", "future", "future.apply", "furrr"), library, character.only=T)
+
+# set system time
+Sys.setenv(TZ = "America/Los_Angeles")
+
+# environmental data for predictions
+load("../Data/Environment/env_pred_full.RData")
+```
+
+Select models and time period to predict over
+```{r}
+# open optimal nasc model: dynamic_logdepth with ensemble approach
+path_modeltibble_nasc <- "../3-NASC_models/Outputs/modelsH_krill_dynlogdep.RData"
+selected_model_nasc <- "dynamic_logdep"
+
+# open optimal biomass model: topographic_logdepth with ensemble approach
+path_modeltibble_biomass <- "../4-Biomass_models/Outputs/modelsH_krillmass_topolog.RData"
+selected_model_biomass <- "topographic_logdep"
+
+#Months x years to predict year-round
+pred_subset <- tidyr::crossing(years = c(2016:2024), months = c(1:12))
+pred_subset <- paste0("X", pred_subset$years, ".", pred_subset$months)
+pred_subset <- pred_subset[!(pred_subset %in% c("X2024.7", "X2024.8", "X2024.9", "X2024.10", "X2024.11", "X2024.12"))]
+
+# select only these periods in the full prediction rasters             
+env_pred_selected <- env_pred_full %>% 
+  filter(substr(pred_months, 1, 7) %in% pred_subset)
+unique(env_pred_selected$pred_months)
+```
+
+# Functions
+```{r}
+## BRT bin x GAM abun predictions
+Fun_crossENSpredall <- function(m_name, m_tb, ras, fam, path_outputs){
+  ddply(m_tb, ~folds, function(tb){
+    # select env variables from model
+    var_tokeep_bin <- tb %>% 
+      filter(model_name == m_name & family == "bin" & method == "GAM") %>% 
+      pull(model_var)
+    var_tokeep_abu <- tb %>% 
+      filter(model_name == m_name & family == fam & method == "GAM") %>% 
+      pull(model_var)
+    # model of presence
+    m.bin <- tb %>% 
+      filter(model_name == m_name & family == "bin" & method == "BRT") %>% 
+      pull(model)
+    # remove first character of path "." and replace by path to folder step 3- or 4-
+    load(paste0(path_outputs, sub(".", "", m.bin[[1]])))
+    m.bin.m <- mod_brt$model[[1]]
+    # model of abundance
+    m.abu <- tb %>% 
+      filter(model_name == m_name & family == fam & method == "GAM") %>% 
+      pull(model)
+    load(paste0(path_outputs, sub(".", "", m.abu[[1]])))
+    m.abu.m <- mod_gam
+    # produce predictions per week then average
+    ras %>% 
+      mutate(pred = map(env_ras, function(r){
+        pred <- r %>% 
+          mutate(pred_week = map(data_pred, function(r_week){
+            # calculate log depth (suppres warnings because there are some positive values on the eastern edge of the extent that produce a warning with log(negative))
+            suppressWarnings(r_week$logDEPTH <- calc(r_week$DEPTH, function(x) log(-x)))
+            # get rid of variables in raster that are not in the model
+            r_week_bin <- r_week[[var_tokeep_bin[[1]]]]
+            r_week_abu <- r_week[[var_tokeep_abu[[1]]]]
+            # then make predictions on raster!
+            pred1 <- raster::predict(r_week_bin, m.bin.m, type = "response",
+                                      n.trees = m.bin.m$gbm.call$best.trees)
+            pred2 <- raster::predict(r_week_abu, m.abu.m, type = "response")
+            predH <- pred1 * pred2
+            return(predH)
+          })) %>% 
+          select(week_names, pred_week) 
+      }))
+  }) %>%
+    select(folds, pred_months, pred) %>% 
+    unnest(pred)
+}
+```
+
+# Predicted maps of NASC
+
+```{r, eval = F}
+load(path_modeltibble_nasc)
+
+# generate NASC predictions per fold, per month, per week
+# the result is a tibble containing 4 columns: folds, pred_months, week_names, pred_week
+# the actual predicted weekly rasters are stored in the pred_week column
+pred_nasc <- Fun_crossENSpredall(m_name = selected_model_nasc,  
+                                 m_tb = modelsH_krill_dynlogdep, 
+                                 fam = "lognasc",
+                                 ras = env_pred_selected,
+                                 path_outputs = "../3-NASC_models")
+
+save(pred_nasc, file = "./Outputs/pred_nasc.RData")
+rm(modelsH_krill_dynlogdep)
+
+# average NASC predictions across folds, per week
+# the result is a tibble containing 3 columns: pred_months, week_names, pred_weekly
+# the actual predicted weekly rasters are stored in the pred_weekly column
+pred_nasc_weekly <- ddply(pred_nasc, .(pred_months, week_names), function(d){
+   tibble(pred_weekly = list(mean(stack(d$pred_week), na.rm = T)))
+})
+
+save(pred_nasc_weekly, file = "./Outputs/pred_nasc_weekly.RData")
+```
+
+
+```{r, eval = T}
+load("./Outputs/pred_nasc_weekly.RData")
+# plot a few rasters to check it looks right
+spplot(stack(pred_nasc_weekly$pred_weekly[c(1:8)]))
+# check names of alyers in the plot
+pred_nasc_weekly$week_names[c(1:8)]
+```
+
+
+# Predicted maps of biomass proportion
+
+## Predictions of biomass per species
+
+```{r, eval = F}
+load("./Outputs/pred_nasc_weekly.RData")
+load(path_modeltibble_biomass)
+
+# generate Biomass predictions per species, per fold
+# given that we selected a topographic model that does not include any dynamic variables, the predictions are constant through time and a single layer is derived (no weekly layers)
+pred_mass <- ddply(modelsH_krillmass_topolog, ~group, function(d) {
+  Fun_crossENSpredall(m_name = selected_model_biomass,  
+                      m_tb = d, 
+                      fam = "logmass",
+                      # considering the static nature of this prediction 
+                      # we only use the first rasterstack of env_pred_selected
+                      # there will be four identical predictions for that first month
+                      ras = env_pred_selected[1,],
+                      path_outputs = "../4-Biomass_models")})
+
+# average NASC predictions across folds, per group (EPAC or TSPIN)
+# the result is a tibble containing 4 columns: group, pred
+# the actual predicted rasters are stored in the pred column
+pred_mass <- ddply(pred_mass, .(group, pred_months), function(d){
+  # the same four weekly predictions are averaged together across folds
+  tibble(pred = list(mean(stack(d$pred_week), na.rm = T)))
+})
+save(pred_mass, file = "./Outputs/pred_mass.RData")
+```
+
+## Predicted biomass proportion maps
+
+Calculate the predicted oportion of EPAC and TSPIN
+```{r}
+load("./Outputs/pred_mass.RData")
+
+# generate two separate raster of Epac and Tspin proportion
+epac_prop <- pred_mass[pred_mass$group == "EPAC", ]$pred[[1]] /
+  (pred_mass[pred_mass$group == "EPAC", ]$pred[[1]] + pred_mass[pred_mass$group == "TSPIN", ]$pred[[1]])
+  
+tspin_prop <- pred_mass[pred_mass$group == "TSPIN", ]$pred[[1]] /
+  (pred_mass[pred_mass$group == "EPAC", ]$pred[[1]] + pred_mass[pred_mass$group == "TSPIN", ]$pred[[1]])
+
+spplot(stack(list(epac_prop, tspin_prop)))
+```
+
+
+# Predicted species-scaled NASC
+
+```{r, eval = T}
+load("./Outputs/pred_nasc_weekly.RData")
+
+pred_krill_species_scaled_NASC <- pred_nasc_weekly %>% 
+  mutate(date_index = map_chr(week_names, function(w) {
+    #remove the prefix in the week name to obtain the date of the last day of the last 4 weeks included in that month
+    last_day <- strsplit(w, "X")[[1]][3]
+    # select the prefix of the week name to obtain the number of days prior to last_day
+    nb_days_prior <- as.numeric(strsplit(w, "X")[[1]][2])
+    # substract nb_days_prior to last_day in POSIXct format to obtain the actual date at which the layer was computed
+    as.character(as.POSIXct(last_day, format = "%Y.%m.%d", tz = "GMT") - nb_days_prior * 3600 * 24)
+  })) %>% 
+  mutate(pred_epac = pmap(list(nasc = pred_weekly, w = date_index), function(nasc, w){
+    # generate species-scaled NASC prediction
+    r <- nasc * epac_prop
+    # export weekly prediction as a netcdf raster
+    writeRaster(r, filename = paste0("./Outputs/predicted_rasters/EPAC_", w, ".nc"), overwrite = T)
+    return(r)
+  })) %>% 
+  mutate(pred_tspin = pmap(list(nasc = pred_weekly, w = date_index), function(nasc, w){
+    # generate species-scaled NASC prediction
+    r <- nasc * tspin_prop
+    # export weekly prediction as a netcdf raster
+    writeRaster(r, filename = paste0("./Outputs/predicted_rasters/TSPIN_", w, ".nc"), overwrite = T)
+    return(r)
+  })) %>% 
+  select(pred_months, date_index, week_names, pred_epac, pred_tspin) %>% 
+  rename(month_index = pred_months)
+  
+
+save(pred_krill_species_scaled_NASC, file = "./Outputs/pred_krill_species_scaled_NASC.RData")
+```
+

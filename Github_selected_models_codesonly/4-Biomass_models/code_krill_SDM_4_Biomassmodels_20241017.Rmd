@@ -1,0 +1,962 @@
+---
+title: "Krill TSPIN and EPAC bongo net biomass SDMs"
+author: "Solene Derville"
+date: "`r format(Sys.time(), '%d %B, %Y, %H:%M')`"
+output: 
+   html_document:
+    highlight: pygments
+    keep_md: false
+    number_sections: true
+    toc: true
+    toc_float:
+      collapsed: false
+---
+
+### FILE PATHS
+```{r, echo=F, result="hide", include=F}
+lib=lapply(c("plyr","officer","raster","stars", "sf", "viridis", "ggthemes", "patchwork", "doParallel", "foreach", 
+             "tidyverse", "lubridate", "mgcv", "gratia", "ape", "gstat", "RColorBrewer", "caret", "gbm", "dismo", 
+             "pROC", "gstat", "future", "future.apply", "furrr", "fmsb", "gridExtra"), library, character.only=T)
+
+mon_theme <- theme(
+        panel.border = element_rect(linewidth=0.5,color="black", fill="transparent"),
+        plot.margin=unit(c(2,2,2,2),"mm"),
+        panel.background = element_rect(fill = 'white'),
+        text=element_text(face="bold", size=7),
+        title = element_text(size=rel(1)))
+
+krillsp_col <- data.frame(group = c("EPAC", "TSPIN"),
+                          col = c("#e1c340", "#4cd7d0"))
+krillsp_pal <- c("#e1c340",  "#4cd7d0")
+
+Sys.setenv(TZ = "America/Los_Angeles")
+```
+
+Environmental data for predictions
+```{r, warning = F}
+load("../Data/Environment/env_pred_full.RData")
+depth_ras <- env_pred_full$env_ras[[1]]$data_pred[[1]]$DEPTH
+```
+
+Environmental data for maps
+```{r, warning = F, message = F}
+# coastline shapefile
+coast_sf <- st_read("../Data/Environment/coast_openstreetmap_WA-OR-CA.shp")
+coast_sf_utm <- st_transform(coast_sf, crs = 32610)
+
+# isobaths
+iso_sf <- st_read("../Data/Environment/isobaths_50mto1500m.shp")
+iso_sf_utm <- st_transform(iso_sf, crs = 32610)
+
+# isobath 1500 m
+iso_sf1500 <- st_read("../Data/Environment/iso_sf1500.shp")
+
+# Extent of study area for predictions (OR coastal waters only)
+extent_study_area <-  extent(-125.32, -123, 42, 46.3)
+extent_study_area_wide <-  extent(-129, -122.3, 37.5, 48) # min and max long correspond to min and max of krill_day_df
+
+# Habitat shapefiles
+load("../Data/Environment/zones_split.RData")
+```
+
+Bongo nets' data
+```{r}
+load("../2-Environment/Outputs/biomass_df.RData")
+nrow(biomass_df)
+
+###############################
+####### NCC cruise stations ###
+biomass_df <- biomass_df %>% 
+  # remove daytime bongos except for 092118NH65 because it was dusk
+  filter(Day_Night != "D" | Sample.Code == "092118NH65") %>% 
+  # change names of columns and compute density and mass by species
+  rename(mass_EPAC_juv = "Biomass.Carbon..mg.m3..EUPHAUSIA.PACIFICA_Juvenile",
+         mass_EPAC_adu = "Biomass.Carbon..mg.m3..EUPHAUSIA.PACIFICA_Adult",
+         mass_EPAC_adf = "Biomass.Carbon..mg.m3..EUPHAUSIA.PACIFICA_Female..Adult",
+         mass_EPAC_adm = "Biomass.Carbon..mg.m3..EUPHAUSIA.PACIFICA_Male..Adult",
+         
+         mass_TSPIN_juv = "Biomass.Carbon..mg.m3..THYSANOESSA.SPINIFERA_Juvenile",
+         mass_TSPIN_adu = "Biomass.Carbon..mg.m3..THYSANOESSA.SPINIFERA_Adult",
+         mass_TSPIN_adf = "Biomass.Carbon..mg.m3..THYSANOESSA.SPINIFERA_Female..Adult",
+         mass_TSPIN_adm = "Biomass.Carbon..mg.m3..THYSANOESSA.SPINIFERA_Male..Adult",
+         
+         dens_EPAC_juv = "Density....m3..EUPHAUSIA.PACIFICA_Juvenile",
+         dens_EPAC_adu = "Density....m3..EUPHAUSIA.PACIFICA_Adult",
+         dens_EPAC_adf = "Density....m3..EUPHAUSIA.PACIFICA_Female..Adult",
+         dens_EPAC_adm = "Density....m3..EUPHAUSIA.PACIFICA_Male..Adult",
+         
+         dens_TSPIN_juv = "Density....m3..THYSANOESSA.SPINIFERA_Juvenile",
+         dens_TSPIN_adu = "Density....m3..THYSANOESSA.SPINIFERA_Adult",
+         dens_TSPIN_adf = "Density....m3..THYSANOESSA.SPINIFERA_Female..Adult",
+         dens_TSPIN_adm = "Density....m3..THYSANOESSA.SPINIFERA_Male..Adult") %>% 
+  mutate(mass_EPAC = mass_EPAC_juv + mass_EPAC_adu + mass_EPAC_adf + mass_EPAC_adm,
+         mass_TSPIN = mass_TSPIN_juv + mass_TSPIN_adu + mass_TSPIN_adf + mass_TSPIN_adm,
+         mass_tot = mass_EPAC + mass_TSPIN,
+         dens_tot = dens_EPAC_adu + dens_EPAC_juv + dens_EPAC_adf + dens_EPAC_adm +
+                    dens_TSPIN_adu + dens_TSPIN_juv + dens_TSPIN_adf + dens_TSPIN_adm) %>% 
+  st_as_sf() %>% 
+  st_join(zones_split) %>% 
+  # remove geometry because it makes the brt / gam loop crash
+  as.data.frame() %>% 
+  select(-geometry) %>% 
+  # add log depth
+  mutate(logDEPTH = log(-DEPTH))
+nrow(biomass_df)
+
+save(biomass_df, file = "./Outputs/biomass_df.RData")
+
+###############################
+####### NH Line stations ######
+load("../2-Environment/Outputs/biomass_nhl_df.RData")
+
+biomass_nhl_df <- biomass_nhl_df %>% 
+  rename(mass_EPAC = EUPHAUSIA.PACIFICA, mass_TSPIN = THYSANOESSA.SPINIFERA) %>% 
+  mutate(mass_tot = mass_EPAC + mass_TSPIN)
+
+save(biomass_nhl_df, file = "./Outputs/biomass_nhl_df.RData")
+```
+Predictions from step 3-NASC_models
+```{r}
+load("../3-NASC_models/Outputs/predyear_crossENSavg_dynlogdep.RData")
+```
+
+Functions
+```{r}
+# create custom function to run BRTs in a hierarchical approach
+Fun_mybrt <- function(d, v, fam){
+  # find what columns the names of the variables correspond to
+  var_num <- match(v, names(d))
+  var_y <- match("mass", names(d))
+  # set starting learning rate (usually between 0.01 and 0.001)
+  lr <- 0.001 # this was 0.01 in the  nasc version but here with biomass with 0.01 I tended to have target.trees < 1000 for several rounds of the loop
+
+  target.trees <- 0 # resets the target trees , make sure set condition to lower than 1000
+
+  while (target.trees < 1000) {
+  
+    mod.brt <- gbm.step(d,
+                     gbm.x = var_num, # Your predictor variables, referring to columns in your data frame
+                     gbm.y = var_y, # Your response variable
+                     family = fam,
+                     n.trees = 50,
+                     bag.fraction = 0.8, # 0.75 is typical for larger dataset, but can increase bag fraction if dataset is small 
+                     plot.main = F,   
+                     learning.rate = lr,
+                     tree.complexity = 2,
+                     verbose = F)  
+  
+    if (object.size(mod.brt) > 0) {    # > 0 = good, check if hasn't crashed
+      target.trees <- mod.brt$gbm.call$best.trees
+    }
+    else {
+      target.trees <- 0  #check if model size is zero 
+    }
+    lr <- lr / 2
+  }
+  out <- tibble(model = list(mod.brt),
+                lr = lr)
+  return(out)
+}
+
+# create function to make dataframe predictions from a hierarchical modelling approach: binomial and gamma models
+# to specific periods stored in env layers ras
+# m_name is the model name = predictors chosen
+# here fam should be a vector of the two families bin and logmass
+# method is to indicate if the model is a GAM or BRT
+Fun_Hpredras <- function(m_name, fam, m_tb, ras, met){
+  ddply(m_tb, ~folds, function(tb){
+    # select env variables from model
+    var_tokeep <- tb %>% 
+      filter(model_name == m_name & family == fam & method == met) %>% 
+      pull(model_var)
+    # model of presence
+    m1 <- tb %>% 
+      filter(model_name == m_name & family == fam[1] & method == met) %>% 
+      pull(model)
+    load(m1[[1]])
+    if(met == "BRT"){m1m <- mod_brt$model[[1]]}
+    if(met == "GAM"){m1m <- mod_gam}
+    # model of abundance
+    m2 <- tb %>% 
+      filter(model_name == m_name & family == fam[2] & method == met) %>% 
+      pull(model)
+    load(m2[[1]])
+    if(met == "BRT"){m2m <- mod_brt$model[[1]]}
+    if(met == "GAM"){m2m <- mod_gam}
+    # produce predictions per week then average
+    ras %>% 
+      mutate(pred = map(env_ras, function(r){
+        pred <- r %>% 
+          mutate(pred_week = map(data_pred, function(r_week){
+            # calculate log depth (suppres warnings because there are some positive values on the eastern edge of the extent that produce a warning with log(negative))
+            suppressWarnings(r_week$logDEPTH <- calc(r_week$DEPTH, function(x) log(-x)))
+            # get rid of variables in raster that are not in the model
+            r_week <- r_week[[var_tokeep[[1]]]]
+            # then make predictions on raster!
+            if(met == "BRT"){
+              pred1 <- raster::predict(r_week, m1m, type = "response",
+                                      n.trees = m1m$gbm.call$best.trees)
+              pred2 <-  raster::predict(r_week, m2m, type = "response",
+                                      n.trees = m2m$gbm.call$best.trees)
+              pred2 <- exp(pred2)} # response is logged in brt
+            if(met == "GAM"){
+              pred1 <- raster::predict(r_week, m1m, type = "response")
+              pred2 <- raster::predict(r_week, m2m, type = "response")
+            }
+            predH <- pred1 * pred2
+            return(predH)
+          }))
+          # average across four weeks with NA.rm
+          mean_pred <- calc(stack(pred$pred_week), function(x) mean(x, na.rm = T))
+          return(mean_pred)
+      }))
+  })
+}
+
+## BRT bin x GAM abun
+Fun_crossENSpredras <- function(m_name, m_tb, ras){
+  ddply(m_tb, ~folds, function(tb){
+    # select env variables from model
+    var_tokeep_bin <- tb %>% 
+      filter(model_name == m_name & family == "bin" & method == "GAM") %>% 
+      pull(model_var)
+    var_tokeep_abu <- tb %>% 
+      filter(model_name == m_name & family == "logmass" & method == "GAM") %>% 
+      pull(model_var)
+    # model of presence
+    m.bin <- tb %>% 
+      filter(model_name == m_name & family == "bin" & method == "BRT") %>% 
+      pull(model)
+    load(m.bin[[1]])
+    m.bin.m <- mod_brt$model[[1]]
+    # model of abundance
+    m.abu <- tb %>% 
+      filter(model_name == m_name & family == "logmass" & method == "GAM") %>% 
+      pull(model)
+    load(m.abu[[1]])
+    m.abu.m <- mod_gam
+    # produce predictions per week then average
+    ras %>% 
+      mutate(pred = map(env_ras, function(r){
+        pred <- r %>% 
+          mutate(pred_week = map(data_pred, function(r_week){
+            # calculate log depth (suppres warnings because there are some positive values on the eastern edge of the extent that produce a warning with log(negative))
+            suppressWarnings(r_week$logDEPTH <- calc(r_week$DEPTH, function(x) log(-x)))
+            # get rid of variables in raster that are not in the model
+            r_week_bin <- r_week[[var_tokeep_bin[[1]]]]
+            r_week_abu <- r_week[[var_tokeep_abu[[1]]]]
+            # then make predictions on raster!
+            pred1 <- raster::predict(r_week_bin, m.bin.m, type = "response",
+                                      n.trees = m.bin.m$gbm.call$best.trees)
+            pred2 <- raster::predict(r_week_abu, m.abu.m, type = "response")
+            predH <- pred1 * pred2
+            return(predH)
+        }))
+        # average across four weeks with NA.rm
+        mean_pred <- calc(stack(pred$pred_week), function(x) mean(x, na.rm = T))
+        return(mean_pred)
+      }))
+  })
+}
+
+# create function to turn tibble of rasters into one dataframe that can generate a ggplot
+Fun_meanpredmaps <- function(ras_tb){
+  
+  # transform into sf format
+  d <- ras_tb %>% 
+    mutate(pred_df = map(meanpred, function(r){
+      # turn raster to sf object
+      d <- r %>% 
+        st_as_stars() %>%
+        st_as_sf(as_points = T, crs = 32610) %>% 
+        rename(fit = layer)
+      # add coordinates to dataframe of predictions
+      d[c("x", "y")] <- st_coordinates(d)
+      return(d)
+    })) %>% 
+    mutate(month = lubridate::month(as.POSIXct(pred_months, format = "X%Y.%m.%d"),
+                        label = TRUE, abbr = TRUE, locale="EN-us"),
+           year = lubridate::year(as.POSIXct(pred_months, format = "X%Y.%m.%d")),
+           period = paste(month, year)) %>%  
+    dplyr::select(period, month, year, pred_df) %>%
+    # arrange and mutate factor levels so that plots show up in the right order by months 
+    arrange(year, month) %>% 
+    mutate(period = factor(period, levels = unique(period))) %>% 
+    unnest(pred_df)
+  
+  # create facetted maps by year in columns and months in rows
+  g <- ggplot() +
+    geom_tile(data = d, aes(x, y, fill = log(fit + 0.1))) +
+    scale_fill_viridis_b(na.value = "transparent", 
+                         name = "Predicted \nlog biomass",
+                         n.breaks = 6) +  
+    geom_sf(data = iso_sf_utm[iso_sf_utm$g_2020_ %in% c(-200, -1500), ], 
+            col = "grey80", linewidth = 0.1) +
+    geom_sf(data = coast_sf_utm, col = NA, fill = "grey10") +
+    facet_wrap(~period, ncol = n_distinct(d$year), dir = "v") +
+    coord_sf(xlim = c(-30592.78, 561873.5), ylim = c(4150571, 5378175), expand = F) +
+    mon_theme +
+    xlab("") +
+    ylab("") +
+    theme(axis.text.y = element_text(angle = 90, hjust = 0.5),
+          axis.text.x = element_text(hjust = 0.9),
+          text=element_text(face="bold", size=8),
+          legend.key.size = unit(0.8, "lines"),
+          panel.spacing = unit(0.5, "lines"),
+          plot.margin = unit(c(0.1, 0.1, 0.1, 0.1), "cm"))
+    
+    return(g)
+}
+
+# a derivative of the function meanpredmaps but applied to biomass proportions by species
+Fun_propmaps <- function(ras_tb){
+  
+  # transform into sf format
+  d <- ras_tb %>% 
+    mutate(pred_df = map(meanpred, function(r){
+      # turn raster to sf object
+      d <- r %>% 
+        st_as_stars() %>%
+        st_as_sf(as_points = T, crs = 32610) %>% 
+        rename(fit = layer)
+      # add coordinates to dataframe of predictions
+      d[c("x", "y")] <- st_coordinates(d)
+      return(d)
+    })) %>% 
+    mutate(month = lubridate::month(as.POSIXct(pred_months, format = "X%Y.%m.%d"),
+                        label = TRUE, abbr = TRUE, locale="EN-us"),
+           year = lubridate::year(as.POSIXct(pred_months, format = "X%Y.%m.%d")),
+           period = paste(month, year)) %>%  
+    dplyr::select(period, month, year, pred_df) %>%
+    # arrange and mutate factor levels so that plots show up in the right order by months 
+    arrange(year, month) %>% 
+    mutate(period = factor(period, levels = unique(period))) %>% 
+    unnest(pred_df)
+  
+  # create facetted maps by year in columns and months in rows
+  g <- ggplot() +
+    geom_tile(data = d, aes(x, y, fill = fit*100)) +
+    scale_fill_viridis_b(na.value = "transparent", 
+                         name = "Predicted \n Proportion (%)",
+                         n.breaks = 6) +  
+    geom_sf(data = iso_sf_utm[iso_sf_utm$g_2020_ %in% c(-200, -1500), ], 
+            col = "grey80", linewidth = 0.1) +
+    geom_sf(data = coast_sf_utm, col = NA, fill = "grey10") +
+    facet_wrap(~period, ncol = n_distinct(d$year), dir = "v") +
+    coord_sf(xlim = c(-30592.78, 561873.5), ylim = c(4150571, 5378175), expand = F) +
+    mon_theme +
+    xlab("") +
+    ylab("") +
+    theme(axis.text.y = element_text(angle = 90, hjust = 0.5),
+          axis.text.x = element_text(hjust = 0.9),
+          text=element_text(face="bold", size=8),
+          legend.key.size = unit(0.8, "lines"),
+          panel.spacing = unit(0.5, "lines"),
+          plot.margin = unit(c(0.1, 0.1, 0.1, 0.1), "cm"))
+    
+    return(g)
+}
+```
+
+# Running SDMs
+## Set up models
+
+### Predictor formulas
+```{r}
+# only the main candidate models are being run in this code to speed up the process. See "Github_all_models" for codes of all models presented in the manuscript
+form_chr <- list(
+     "topographic_logdep" = " mass ~
+                   s(logDEPTH, k = 5) + 
+                   s(SLOPE, k = 5) + 
+                   s(DIS_CANYON, k = 5)",
+     "dynamic_logdep" = "mass ~ 
+                   s(logDEPTH, k = 5) +
+                   s(DIS_CANYON, k = 3) + 
+                   s(SLOPE, k = 3) + 
+                   s(sst, k = 3) + 
+                   s(ssh, k = 3) + 
+                   s(sshsd, k = 3) + 
+                   s(sstsd, k = 3) + 
+                   s(eke, k = 3) +
+                   s(curl, k = 3) + 
+                   s(ild_05, k = 3) + 
+                   s(bbv_200, k = 3)",
+     "dynamic_sst" = "mass ~
+                   s(logDEPTH, k = 5) + 
+                   s(SLOPE, k = 5) + 
+                   s(DIS_CANYON, k = 5) + 
+                   s(sst, k = 5)")
+
+model_type <- c(rep("topo", 1), rep("dyn", 2))
+model_var <- list(
+                   c("logDEPTH","SLOPE", "DIS_CANYON"),
+                   c("logDEPTH","DIS_CANYON", "SLOPE", "sst", "ssh", "sshsd", "sstsd","eke", "curl", "ild_05", "bbv_200"),
+                   c("logDEPTH","SLOPE", "DIS_CANYON", "sst"))
+```
+
+### Folds and model types
+```{r}
+# because there are at least two cruises in each season (Feb, May, Sep) we can leave one out at each run and still have the three seasons represented in the training dataset
+Fun_folding <- function(df){
+  # set seed to NULL so that we can rerun multiple times until we get a combination of folds without zero presence
+  folds <- splitTools::create_folds(df$CruiseID, k = 10, seed = 1, type = "grouped")
+  d_cv <- llply(folds, function(f){
+    df$fold <- "test"
+    df[f,]$fold <- "train"
+    return(df)
+  })
+  return(d_cv)
+}
+
+unique(biomass_df$CruiseID)
+
+# there are ten folds in the bongo biomass dataset (vs 8 in the nasc) because the 2018 february/march cruise does not have nasc data
+krillmass_cv <- tibble(folds = paste0("Fold", c(1:10)),
+                   data = Fun_folding(biomass_df))
+
+modelsH_krillmass_tb <- tibble(model_form = form_chr) %>%
+    mutate(model_name = names(form_chr),
+         model_type = model_type,
+         model_var = model_var,
+         model_form = map(model_form, as.formula),
+         data = rep(list(krillmass_cv), length(form_chr))) %>% 
+  unnest(cols = c(data))
+modelsH_krillmass_tb
+
+# concatenate the tibble 2 times for the two krill species
+modelsH_krillmass_tb <- rbind(modelsH_krillmass_tb, modelsH_krillmass_tb) %>% 
+  mutate(group = rep(c("EPAC", "TSPIN"), each = nrow(modelsH_krillmass_tb))) %>% 
+  # create a mass variable by species
+  mutate(data = pmap(.l = list(x = data, y = group), .f = function(x, y){
+    # add the new variable by sp
+    x$mass <- as.data.frame(x[,paste0("mass_", y)])[, 1]
+    return(x)
+  }))
+```
+
+### Run models
+```{r, eval = F}
+modelsH_krillmass_tb <- modelsH_krillmass_tb %>%
+  ## BINOMIAL MODELS
+  mutate(bin = pmap(list(a = data, b = model_var, c = model_form, mn = model_name, gr = group, fo = folds), .f = function(a, b, c, mn, gr, fo){ 
+      # create data set with binomial response
+      a_modified <- a %>% mutate(mass = ifelse(mass == 0, 0, 1))
+      # in the case of GAMs, the explanatory variables should not have NAs
+      a_modified_gam <- a_modified[complete.cases(a_modified[b]), ]
+      # run models
+      mod_brt <- Fun_mybrt(d = subset(a_modified, fold == "train"), 
+                           v = b, fam = "bernoulli")
+      mod_gam <- gam(c, family = binomial(link = "logit"), 
+                      method = "REML",
+                      select = T,
+                      data = subset(a_modified_gam, fold == "train"))
+      
+      # save models on disk
+      path_brt <- paste0("./Outputs/models/m_brt_bin_", gr, "_", mn, "_", fo, ".RData")
+      save(mod_brt, file = path_brt)
+      path_gam <- paste0("./Outputs/models/m_gam_bin_", gr, "_", mn, "_", fo, ".RData")
+      save(mod_gam, file = path_gam)
+      
+      rm(mod_gam); rm(mod_brt)
+      
+      # return models in a tibble
+      return(tibble(method = c("BRT", "GAM"),
+                    model = list(path_brt, path_gam)))
+    })) %>%
+  ## POSITIVE VALUES MODEL
+  mutate(logmass = pmap(list(a = data, b = model_var, c = model_form, mn = model_name, gr = group, fo = folds), .f = function(a, b, c, mn, gr, fo){ 
+      # create data set with positive biomass response
+      a_modified_gam <- a %>% 
+                    filter(mass > 0)
+      a_modified_gam <- a_modified_gam[complete.cases(a_modified_gam[b]), ]
+      # in the case of BRT the log should be applied prior to running the model
+      a_modified_brt <- a %>% 
+                    filter(mass > 0) %>% 
+                    mutate(mass = log(mass)) # apply a log link
+      
+      print(paste0("m_abu_", gr, "_", mn, "_", fo))    
+      # run models
+      mod_brt <- Fun_mybrt(d = subset(a_modified_brt, fold == "train"), 
+                           v = b, fam = "gaussian")
+      mod_gam <- gam(c, family = Gamma(link = "log"), 
+                      method = "REML",
+                      select = T,
+                      data = subset(a_modified_gam, fold == "train"))
+      
+      # save models on disk
+      path_brt <- paste0("./Outputs/models/m_brt_logmass_", gr, "_", mn, "_", fo, ".RData")
+      save(mod_brt, file = path_brt)
+      path_gam <- paste0("./Outputs/models/m_gam_logmass_", gr, "_", mn, "_", fo, ".RData")
+      save(mod_gam, file = path_gam)
+      
+      rm(mod_gam); rm(mod_brt)
+      
+      # return path to model objects in a tibble
+      return(tibble(method = c("BRT", "GAM"),
+                    model = list(path_brt, path_gam)))
+    
+    })) 
+
+# pivot tibble and calculate deviance explained by each model
+# in training and in test
+modelsH_krillmass_tb <- modelsH_krillmass_tb %>%
+  pivot_longer(cols = c(bin, logmass), names_to = "family", values_to = "mod") %>% 
+  unnest(cols = c(mod))
+
+# correct data depending on family and method
+modelsH_krillmass_tb <- modelsH_krillmass_tb %>%
+  mutate(data = pmap(list(d = data, v = model_var, fa = family, m = method), 
+                     function(d, v, fa, m){
+      if(fa == "bin" & m == "BRT"){
+        dd <- d %>% mutate(mass = ifelse(mass == 0, 0, 1))
+      }
+      if(fa == "logmass" & m == "BRT"){
+        dd <- d %>% filter(mass > 0) %>% mutate(mass = log(mass))
+      }
+      if(fa == "bin" & m == "GAM"){
+        dd <- d %>% mutate(mass = ifelse(mass == 0, 0, 1))
+        if(!is.null(v)){dd <- dd[complete.cases(dd[v]), ]}
+      }
+      if(fa == "logmass" & m == "GAM"){
+        dd <- d %>% filter(mass > 0)
+      }
+      return(dd)
+  }))
+
+save(modelsH_krillmass_tb, file = "./Outputs/modelsH_krillmass_tb.RData")
+```
+
+# Model performance
+
+## Performance by method by family
+```{r, warning = F, message = F, eval = F}
+load("./Outputs/modelsH_krillmass_tb.RData")
+
+modelsH_krillmass_perf <- modelsH_krillmass_tb %>%
+  mutate(dev.exp = pmap_dbl(list(mo = model, me = method), function(mo, me){
+    load(mo)
+    if(me == "BRT"){
+      dev <- round((mod_brt$model[[1]]$self.statistics$mean.null - mod_brt$model[[1]]$cv.statistics$deviance.mean)/mod_brt$model[[1]]$self.statistics$mean.null*100, 1)
+    }
+    if(me == "GAM"){
+      dev <- round(summary(mod_gam)$dev.expl*100, 1)
+    }
+    rm(mo)
+    return(dev)
+  })) %>%
+  mutate(AUC.train = pmap_dbl(list(mo = model, fa = family, d = data, me = method), function(mo, fa, d, me){
+    load(mo)
+    if(me == "BRT"){m <- mod_brt$model[[1]]}
+    if(me == "GAM"){m <- mod_gam}
+    pred.train <- predict(m, subset(d, fold == "train"), type = "response")
+    if(fa == "bin"){
+        auc <- round(pROC::roc(subset(d, fold == "train")$mass, pred.train)$auc, 3)
+    } else {auc <- NA}
+    return(auc)
+  }))
+
+
+modelsH_krillmass_perf <- modelsH_krillmass_perf %>%
+  # For the test fold, we calculate either AUC for the bin model, or pear.cor/spea.cor for the logmass model
+  mutate(metrics.test = pmap(list(mo = model, fa = family, d = data, me = method), function(mo, fa, d, me){
+    load(mo)
+    if(me == "BRT"){m <- mod_brt$model[[1]]}
+    if(me == "GAM"){m <- mod_gam}
+    test.data <- subset(d, fold == "test")
+    test.data$pred <- predict(m, test.data, type = "response")
+    if(fa == "bin"){ # binomial models need zeros and ones
+      if(nrow(subset(test.data, !is.na(pred) & mass > 0)) > 1 &
+        nrow(subset(test.data, !is.na(pred) & mass == 0)) > 1){
+          auc <- round(pROC::roc(test.data$mass, test.data$pred)$auc, 3)
+          spea.cor <- NA
+          pear.cor <- NA
+      } else { spea.cor <- NA ; auc <- NA ; pear.cor <- NA}
+    } else { # abundance models (no zeros)
+      if(nrow(subset(test.data, !is.na(pred))) > 2){
+          auc <- NA
+          spea.cor <- round(cor.test(test.data$mass, test.data$pred, method = "spearman")$estimate, 3)
+          pear.cor <- round(cor.test(test.data$mass, test.data$pred, method = "pearson")$estimate, 3)
+      } else { spea.cor <- NA ; auc <- NA ; pear.cor <- NA}
+    }
+    metrics <- tibble(spea.cor = spea.cor, pear.cor = pear.cor, AUC.test = auc)
+    return(metrics)
+  })) %>% 
+  unnest(cols = c(metrics.test)) %>% 
+  dplyr::select(group, model_name, family, method, folds, dev.exp, AUC.train, AUC.test, pear.cor, spea.cor) %>% 
+  arrange(group, family)
+
+save(modelsH_krillmass_perf, file = "./Outputs/modelsH_krillmass_perf.RData")
+```
+
+
+```{r, warning = F, message = F}
+load("./Outputs/modelsH_krillmass_perf.RData")
+
+(mean_perf <- modelsH_krillmass_perf %>% 
+  group_by(group, model_name, family, method) %>% 
+  summarize(mean.dev.exp = mean(dev.exp, na.rm = T),
+            mean.AUC.train =  mean(AUC.train, na.rm = T),
+            mean.AUC.test = mean(AUC.test, na.rm = T),
+            mean.pear.cor = mean(pear.cor, na.rm = T),
+            mean.spea.cor = mean(spea.cor, na.rm = T)) %>% 
+  mutate_if(is.numeric, ~ round(., digits = 3)) %>% 
+  select(group, family, everything()) %>% 
+  arrange(group, family, -mean.dev.exp))
+
+```
+
+# Predicted maps of biomass
+
+Selected topographic logdepth of model
+
+```{r, eval = F}
+load("./Outputs/modelsH_krillmass_tb.RData")
+     
+modelsH_krillmass_topolog <- modelsH_krillmass_tb %>% 
+  filter(model_name == "topographic_logdep")
+
+save(modelsH_krillmass_topolog, file = "./Outputs/modelsH_krillmass_topolog.RData")
+```
+
+Months x years to predict year-round
+```{r}
+# select combination of months and years of interest
+pred_subset <- tidyr::crossing(years = c(2018:2022), months = c(1:12))
+pred_subset <- paste0("X", pred_subset$years, ".", pred_subset$months)
+
+# select only these periods in the full environmental data rasters                   
+env_pred_yearround <- env_pred_full %>% 
+  filter(substr(pred_months, 1, 7) %in% pred_subset)
+
+# check that we have the right months represented
+unique(env_pred_yearround$pred_months)
+```
+
+Generate predictions from the Ensemble model
+```{r, eval = F}
+load("./Outputs/modelsH_krillmass_topolog.RData")
+
+predyear_crossENS_topolog_mass <- ddply(modelsH_krillmass_topolog, .(group), function(d) {
+  Fun_crossENSpredras(m_name = "topographic_logdep",  m_tb = d, ras = env_pred_yearround)})
+save(predyear_crossENS_topolog_mass, file = "./Outputs/predyear_crossENS_topolog_mass.RData")
+
+predyear_crossENSavg_topolog_mass <- ddply(predyear_crossENS_topolog_mass, .(group, pred_months), function(d){
+  tibble(meanpred = list(calc(stack(d$pred), function(x) mean(x, na.rm = T))))
+})
+save(predyear_crossENSavg_topolog_mass, file = "./Outputs/predyear_crossENSavg_topolog_mass.RData")
+```
+
+
+# Relationships
+
+With selected topographic-logdepth model
+
+## Variable influence
+```{r}
+load("./Outputs/modelsH_krillmass_topolog.RData")
+
+## GAM
+Fun_VarPVGAM <- function(m){
+  load(m)
+  data.frame(predvar = names(summary(mod_gam)$chi.sq),
+             pv = summary(mod_gam)$s.pv)
+}
+
+Fun_VarInfluGAM <- function(d){
+  data.frame(count0.001 = length(d$pv[d$pv <= 0.001]),
+             count0.01 = length(d$pv[d$pv <= 0.01]),
+             count0.05 = length(d$pv[d$pv <= 0.05]),
+             mean_pvalue = round(mean(d$pv), 3))
+}
+
+influ_gam_topolog_mass <- modelsH_krillmass_topolog %>% 
+  filter(method == "GAM") %>% 
+  mutate(influence = map(model, function(m) Fun_VarPVGAM(m))) %>% 
+  select(group, method, family, folds, influence) %>% 
+  unnest(cols = c(influence)) %>% 
+  ddply(., .(group, method, family, predvar), function(d) Fun_VarInfluGAM(d))
+influ_gam_topolog_mass
+  
+save(influ_gam_topolog_mass, file = "./Outputs/influ_gam_topolog_mass.RData")
+
+### BRT
+influ_brt_topolog_mass <- modelsH_krillmass_topolog %>% 
+  filter(method == "BRT") %>% 
+  mutate(influence = map(model, function(m) {
+    load(m)
+    mod_brt$model[[1]]$contributions})) %>% 
+  select(group, method, family, folds, influence) %>% 
+  unnest(cols = c(influence)) %>% 
+  group_by(group, method, family, var) %>% 
+  summarize(meanInf = mean(rel.inf),
+            sdInf = sd(rel.inf)) %>% 
+  rename(predvar = var)
+influ_brt_topolog_mass
+save(influ_brt_topolog_mass, file = "./Outputs/influ_brt_topolog_mass.RData")
+
+```
+
+## Partial Dependence plots
+
+With selected topographic-logdepth model and ensemble approach
+
+```{r}
+# create a dataframe filled with the average of each variable
+suppressWarnings(
+mean_pred_df <- biomass_df %>% 
+    dplyr::select(modelsH_krillmass_topolog$model_var[[1]]) %>% 
+    summarise_if(is.numeric, function(x) rep(mean(x, na.rm = T), 200))
+)
+
+# for depth I am fixing the mean to 200 m instead of the mean which is about 400 m
+mean_pred_df$logDEPTH <- log(200)
+
+# run predictions over model type and folds
+ENScurves_krillmass_topolog <- modelsH_krillmass_topolog %>% 
+  filter((method == "BRT" & family == "bin") | (method == "GAM" & family == "logmass")) %>% 
+  mutate(pred = map2(model, method, function(m, me){
+    load(m)
+    if(me == "BRT"){
+      m <- mod_brt$model[[1]]
+      var_selec <- m$contributions %>% 
+        filter(rel.inf > 5)
+    }
+    if(me == "GAM"){
+      m <- mod_gam
+      var_selec <- data.frame(predvar = names(summary(m)$chi.sq),
+                        pv = summary(m)$s.pv) %>% 
+        filter(pv <= 0.05) %>% 
+        mutate(var = substr(predvar, 3, (nchar(predvar)-1)))
+    }
+    new_pred <- ddply(var_selec, ~var, function (v){ # for each predictor, calculate response with model m
+        extremes <- quantile(biomass_df[v$var[1]][,1], probs = c(0.01, 0.99), na.rm = T)
+        mean_pred_x_df <- mean_pred_df
+        mean_pred_x_df[,v$var[1]] <- seq(extremes[1], extremes[2], length.out = 200)
+        if(me == "BRT"){
+          pred <- data.frame(fit = raster::predict(m, mean_pred_x_df, type = "response",
+                                      n.trees = m$gbm.call$best.trees))
+          pred$se.fit <- NA # no error estimate in the BRT
+        }
+        if(me == "GAM"){
+          pred <- dismo::predict(m, mean_pred_x_df, type = "response", se.fit = T)
+        }
+        new_pred_df <- data.frame(x = mean_pred_x_df[, v$var[1]])
+        names(new_pred_df) <- "x"
+        new_pred_df$predvar <- v$var[1]
+        new_pred_df$fit <- pred$fit
+        new_pred_df$se <- pred$se.fit
+      return(new_pred_df)
+    })
+  }))
+
+ENScurves_krillmass_topolog <- ENScurves_krillmass_topolog %>% 
+  select(group, family, folds, pred) %>% 
+  unnest(cols = c(pred))
+
+save(ENScurves_krillmass_topolog, file = "./Outputs/ENScurves_krillmass_topolog.RData")
+```
+
+
+# Predicted species-scaled NASC
+
+## Predicted biomass proportion maps
+
+Calculate the proportion of EPAC and TSPIN over monthly rasters
+```{r}
+load("./Outputs/predyear_crossENSavg_topolog_mass.RData")
+
+pred_propbiomass_ENStopolog <- ddply(predyear_crossENSavg_topolog_mass, .(pred_months), function(d){
+  tibble(epac_prop = list(d$meanpred[[1]]/(d$meanpred[[1]] + d$meanpred[[2]])),
+  tspin_prop = list(d$meanpred[[2]]/(d$meanpred[[1]] + d$meanpred[[2]])))
+})
+```
+
+Combine predictions of proportions into a single object. This code was initially built to integrate several different model outputs and compare the fit between predicted and observed species proportions. In this version of code, we simplified the loop to only include our selected model: topographic_logdepth.
+```{r}
+pred_propbiomass <- pred_propbiomass_ENStopolog
+names(pred_propbiomass) <- c("pred_months", "epac_ENStopolog", "tspin_ENStopolog")
+
+pred_propbiomass <- pred_propbiomass %>% 
+  mutate(ras = pmap(list(eetl = epac_ENStopolog, tetl = tspin_ENStopolog), 
+                    function(eetl, tetl){
+                           r <- stack(list(eetl, tetl))
+                           names(r) <- c("epac_ENStopolog", "tspin_ENStopolog")
+                           return(r)
+                         })) %>% 
+  mutate(year.month = paste(str_split_i(pred_months, "[.]", 1), 
+                            str_split_i(pred_months, "[.]", 2), sep = ".")) %>% 
+  select(year.month, ras)
+
+save(pred_propbiomass, file = "./Outputs/pred_propbiomass.RData")
+```
+
+## Calculate NASC x Biomass proportions per species
+
+```{r}
+################################################################
+########## ENS NASC dynlogdep x ENS Biomass prop Topolog #######
+pred_nascXmass_ENSENStopolog <- join(predyear_crossENSavg_dynlogdep, pred_propbiomass_ENStopolog, by = "pred_months") %>% 
+  mutate(pred_epac = pmap(list(nasc_pred = meanpred, prop_pred = epac_prop), function(nasc_pred, prop_pred){
+    nasc_pred * prop_pred
+  })) %>% 
+  mutate(pred_tspin = pmap(list(nasc_pred = meanpred, prop_pred = tspin_prop), function(nasc_pred, prop_pred){
+    nasc_pred * prop_pred
+  })) 
+
+save(pred_nascXmass_ENSENStopolog, file = "./Outputs/pred_nascXmass_ENSENStopolog.RData")
+```
+
+Map predictions for three months of interest
+```{r}
+pred_nascXmass_ENSENStopolog_selec <- pred_nascXmass_ENSENStopolog %>% 
+  filter(substr(pred_months, 7, 7) %in% c("2", "5", "9")) %>% 
+  filter(as.numeric(substr(pred_months, 2, 5)) >= 2018 &
+           as.numeric(substr(pred_months, 2, 5)) <= 2022)
+
+g_epac <- pred_nascXmass_ENSENStopolog_selec %>% 
+  mutate(meanpred = pred_epac) %>% 
+  Fun_meanpredmaps()
+
+g_epac + ggtitle("EPAC: pred NASC dynlogdep ENS x pred biomass proportion topolog ENS")
+
+g_tspin <- pred_nascXmass_ENSENStopolog_selec %>% 
+  mutate(meanpred = pred_tspin) %>% 
+  Fun_meanpredmaps()
+
+g_tspin + ggtitle("TSPIN: pred NASC dynlogdep ENS x pred biomass proportion topolog ENS")
+```
+
+## Evaluate proportion predictions
+
+Create function to generate plots of observed vs predicted proportion
+```{r}
+Fun_evalprop <- function(d, x, y, method, sp){
+  d$x2 <- unlist(d[x]/d$mass_tot)
+  ggpubr::ggscatter(d, x = "x2", y= y, add = "reg.line") +
+    ggpubr::stat_cor(label.y = 1) +
+    ggpubr::stat_regline_equation(label.y = 0.8) +
+    mon_theme +
+    ggtitle(method) +
+    xlab(paste0("Observed proportion of ", sp)) +
+    ylab(paste0("Predicted proportion of ", sp)) +
+    ylim(0, 1) +
+    xlim(0, 1)
+}
+```
+
+Create dataset of evaluation with NH line and NCC stations
+```{r}
+biomass_nhl_df$program <- "NHL"
+biomass_df$program <- "NCC"
+
+all_biomass_eval_df <- rbind(biomass_nhl_df %>% 
+             select(program, date_raster_week, Station, Sample.Date, mass_EPAC, mass_TSPIN, mass_tot, utmx, utmy),
+                             biomass_df %>% 
+             select(program, date_raster_week, Station, Sample.Date, mass_EPAC, mass_TSPIN, mass_tot, utmx, utmy)) %>% 
+  mutate(year.month = paste(str_split_i(date_raster_week, "[.]", 1), str_split_i(date_raster_week, "[.]", 2), sep = ".")) %>% 
+  ddply(., ~year.month, function(d){ # divide biomass data by month
+    # select predictions for that month
+    pred_propbiomass_selec <- pred_propbiomass %>% filter(year.month == d$year.month[1])
+    # extract epac and tspin proportions calculated with Ensemble topographic logdepth models
+    d[c("epac_ENStopolog", "tspin_ENStopolog")] <- raster::extract(x = pred_propbiomass_selec$ras[[1]], y = d[c("utmx", "utmy")])
+    return(d)
+  }) %>% 
+  filter(mass_tot != 0) # remove stations at which there was absolutely no krill (15 stations in NH line)
+
+save(all_biomass_eval_df, file = "./Outputs/all_biomass_eval_df.RData")
+```
+
+Plot regression between predicted and observed biomass proportions
+```{r}
+a <- Fun_evalprop(all_biomass_eval_df, x = "mass_TSPIN", y = "tspin_ENStopolog", method = "ENS - topolog", sp = "Tspin")
+b <- Fun_evalprop(all_biomass_eval_df, x = "mass_EPAC", y = "epac_ENStopolog", method = "", sp = "Epac")
+
+a + b
+```
+
+# Trends in species-scaled NASC predictions
+
+## Temporal trends across the whole study region
+
+```{r}
+load("./Outputs/pred_nascXmass_ENSENStopolog.RData")
+
+krill_final_ENSxENStopolog_trend <- pred_nascXmass_ENSENStopolog %>%
+  mutate(sum_abu_epac = map_dbl(pred_epac, function(r){
+    sum(values(r), na.rm = T)
+  })) %>%
+  mutate(sum_abu_tspin = map_dbl(pred_tspin, function(r){
+    sum(values(r), na.rm = T)
+  })) %>% 
+  dplyr::select(pred_months, sum_abu_epac, sum_abu_tspin) %>% 
+  pivot_longer(cols = c(sum_abu_epac, sum_abu_tspin), 
+               names_to = "group", values_to = "sum_abu",
+               names_prefix = "sum_abu_") %>% 
+  mutate(month = lubridate::month(as.POSIXct(pred_months, format = "X%Y.%m.%d"),
+                        label = TRUE, abbr = TRUE, locale="EN-us"),
+           year = as.factor(year(as.POSIXct(pred_months, format = "X%Y.%m.%d"))),
+           period = paste(month, year)) %>% 
+  arrange(group, year, month) %>% 
+  mutate(period = factor(period, levels = unique(period)))
+
+save(krill_final_ENSxENStopolog_trend, file = "./Outputs/krill_final_ENSxENStopolog_trend.RData")
+```
+
+Mean proportion of Tspin and Epac
+```{r}
+prop_sp <- krill_final_ENSxENStopolog_trend %>% 
+  group_by(group) %>% 
+  summarize(mean_abu = mean(sum_abu))
+
+prop_sp[prop_sp$group == "tspin", "mean_abu"] / prop_sp[prop_sp$group == "epac", "mean_abu"]
+```
+
+## Temporal trends along NH Line
+
+Create a 5 km high raster that just covers the NH line
+```{r}
+# mean latitude of NH Line
+nhl_lat <- mean(biomass_nhl_df$utmy)
+# creating a 5 km band around that latitude
+extent_nhl_band <-  extent(extent(depth_ras)@xmin, extent(depth_ras)@xmax, nhl_lat - 2500, nhl_lat + 2500)
+
+# extract depth along the same line
+depth_nhl <- crop(depth_ras, extent_nhl_band)
+```
+
+Extract predicted species-scaled NASC in the NH Line raster band
+```{r}
+load("./Outputs/pred_nascXmass_ENSENStopolog.RData")
+
+# extract as dataframe the abundance pred for epac and tspin along that band
+krill_nhl_pred_ENSENStopolog_trend <- pred_nascXmass_ENSENStopolog %>%
+  mutate(sum_nhl_epac = map(pred_epac, function(r){
+    names(r) <- "pred_epac"
+    pred_nhl <- crop(r, extent_nhl_band)
+    s <- stack(list(depth_nhl, pred_nhl))
+    d <- as.data.frame(s)
+    d[c("utmx", "utmy")] <- coordinates(s)
+    return(d)
+  })) %>%
+  mutate(sum_nhl_tspin = map(pred_tspin, function(r){
+    names(r) <- "pred_tspin"
+    pred_nhl <- crop(r, extent_nhl_band)
+    d <- as.data.frame(pred_nhl)
+    return(d)
+  })) %>% 
+  dplyr::select(pred_months, sum_nhl_epac, sum_nhl_tspin) %>% 
+  unnest(cols = c(sum_nhl_epac, sum_nhl_tspin)) %>% 
+  filter(!is.na(DEPTH)) %>% # remove portion of the band that is on land
+  pivot_longer(cols = c(pred_epac, pred_tspin), 
+               names_to = "group", values_to = "pred",
+               names_prefix = "pred_") %>% 
+  mutate(month = lubridate::month(as.POSIXct(pred_months, format = "X%Y.%m.%d"),
+                        label = TRUE, abbr = TRUE, locale="EN-us"),
+           year = as.factor(year(as.POSIXct(pred_months, format = "X%Y.%m.%d"))),
+           period = paste(month, year)) %>% 
+  arrange(group, year, month) %>% 
+  mutate(period = factor(period, levels = unique(period)))
+
+save(krill_nhl_pred_ENSENStopolog_trend, file = "./Outputs/krill_nhl_pred_ENSENStopolog_trend.RData")
+```
+
