@@ -1,0 +1,1433 @@
+---
+title: "Krill overall NASC distribution models - OPAL"
+author: "Solene Derville"
+date: "`r format(Sys.time(), '%d %B, %Y, %H:%M')`"
+output: 
+   html_document:
+    highlight: pygments
+    keep_md: yes
+    number_sections: true
+    toc: true
+    toc_float:
+      collapsed: false
+---
+
+### FILE PATHS
+```{r, echo=F, result="hide", include=F}
+lib=lapply(c("plyr","officer","raster","stars", "sf", "viridis", "ggthemes", "patchwork", "doParallel", "foreach", 
+             "tidyverse", "lubridate", "mgcv", "gratia", "ape", "gstat", "RColorBrewer", "caret", "gbm", "dismo", 
+             "pROC", "gstat", "future", "future.apply", "furrr", "fmsb"), library, character.only=T)
+
+mon_theme <- theme(
+        panel.border = element_rect(linewidth=0.5,color="black", fill="transparent"),
+        plot.margin=unit(c(2,2,2,2),"mm"),
+        panel.background = element_rect(fill = 'white'),
+        text=element_text(face="bold", size=7),
+        title = element_text(size=rel(1)))
+```
+
+
+Environmental data for predictions
+```{r, warning = F}
+load("../../2-Environment/Outputs/env_pred_full.RData")
+depth_ras <- env_pred_full$env_ras[[1]]$data_pred[[1]]$DEPTH
+```
+
+Environmental data for maps
+```{r, warning = F, message = F}
+# coastline shapefile
+coast_sf <- st_read("../../Data/Environment/coast_openstreetmap_WA-OR-CA.shp")
+coast_sf_utm <- st_transform(coast_sf, crs = 32610)
+
+# isobaths
+iso_sf <- st_read("../../Data/Environment/isobaths_50mto1500m.shp")
+iso_sf_utm <- st_transform(iso_sf, crs = 32610)
+
+# isobath 1500 m
+iso_sf1500 <- st_read("../../Data/Environment/iso_sf1500.shp")
+
+# Extent of study area for predictions (OR coastal waters only)
+extent_study_area <-  extent(-125.32, -123, 42, 46.3)
+polygon_study_area <- as(extent_study_area, 'SpatialPolygons') %>%
+  st_as_sf() %>%
+  st_set_crs(value = 4326)
+polygon_study_area_utm <- polygon_study_area %>% st_transform(crs = 32610)
+
+# bathy contours as provided by NOAA
+#https://www.fisheries.noaa.gov/inport/item/54364
+extent_study_area_wide <-  extent(-129, -122.3, 37.5, 48) # min and max long correspond to min and max of krill_day_df
+bathy_contour <- st_as_sf(terra::vect("../../Data/Environment/BathymetricContour/BathymetryContours.gdb")) %>% #thi is in epsg 4269
+  st_transform(crs = 4326) %>% 
+  st_crop(., extent_study_area_wide)
+#plot(bathy_contour['Contour'])
+
+# Habitat shapefiles
+load("./Outputs/zones_split.RData")
+
+# latitude zones
+lat_sf <- data.frame(lat = rep(c(40.4, 42.8, 44.4, 46), each = 2), 
+                          lon = rep(c(-129, -122.3), 4),
+                          id = c(1, 1, 2, 2, 3, 3, 4, 4)) %>% 
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) %>% 
+  group_by(id) %>% 
+  summarize() %>% 
+  st_cast('LINESTRING') %>% 
+  st_transform(crs = st_crs(32610))
+```
+
+
+```{r}
+####################
+### Echosounder data
+
+load("../2-Environment/Outputs/krill_agg_df.RData")
+# select only daytime
+krill_day_df <- krill_agg_df %>% 
+  filter(phase == "day") %>% 
+  mutate(yday = yday(as.POSIXct(as.character(Date_M), format = "%Y%m%d")),
+         CruiseID = paste0("SH", substr(Date_M, 3, 6))) %>% 
+  # a bunch of cruise ID need to be recoded to match with does in the bongo data
+  # ignore warning
+  mutate(CruiseID = car::recode(CruiseID, "'SH1805' = 'SH1804'; 'SH1809'='SH1811'; 'SH1905'='SH1904'; 'SH1909'='SH1908'; 'SH2003'='SH2002'; 'SH2209'='SH2210'; 'SH2009'='SH2010'")) %>% 
+  # add log depth
+  mutate(logDEPTH = log(-DEPTH))
+
+save(krill_day_df, file = "./Outputs/krill_day_df.RData")
+```
+
+Functions
+```{r}
+# create function to make dataframe predictions from a hierarchical modelling approach: binomial and gamma models
+# to specific periods stored in env layers ras
+# m_name is the model name = predictors chosen
+# here fam should be a vector of the two families bin and lognasc
+# method is to indicate if the model is a GAM or BRT
+Fun_Hpredras <- function(m_name, fam, m_tb, ras, met){
+  ddply(m_tb, ~folds, function(tb){
+    # select env variables from model
+    var_tokeep <- tb %>% 
+      filter(model_name == m_name & family == fam & method == met) %>% 
+      pull(model_var)
+    # model of presence
+    m1 <- tb %>% 
+      filter(model_name == m_name & family == fam[1] & method == met) %>% 
+      pull(model)
+    load(m1[[1]])
+    if(met == "BRT"){m1m <- mod_brt$model[[1]]}
+    if(met == "GAM"){m1m <- mod_gam}
+    # model of abundance
+    m2 <- tb %>% 
+      filter(model_name == m_name & family == fam[2] & method == met) %>% 
+      pull(model)
+    load(m2[[1]])
+    if(met == "BRT"){m2m <- mod_brt$model[[1]]}
+    if(met == "GAM"){m2m <- mod_gam}
+    # produce predictions per week then average
+    ras %>% 
+      mutate(pred = map(env_ras, function(r){
+        pred <- r %>% 
+          mutate(pred_week = map(data_pred, function(r_week){
+            # calculate log depth (suppres warnings because there are some positive values on the eastern edge of the extent that produce a warning with log(negative))
+            suppressWarnings(r_week$logDEPTH <- calc(r_week$DEPTH, function(x) log(-x)))
+            # get rid of variables in raster that are not in the model
+            r_week <- r_week[[var_tokeep[[1]]]]
+            # then make predictions on raster!
+            if(met == "BRT"){
+              pred1 <- raster::predict(r_week, m1m, type = "response",
+                                      n.trees = m1m$gbm.call$best.trees)
+              pred2 <-  raster::predict(r_week, m2m, type = "response",
+                                      n.trees = m2m$gbm.call$best.trees)
+              pred2 <- exp(pred2)} # response is logged in brt
+            if(met == "GAM"){
+              pred1 <- raster::predict(r_week, m1m, type = "response")
+              pred2 <- raster::predict(r_week, m2m, type = "response")
+            }
+            predH <- pred1 * pred2
+            return(predH)
+          }))
+          # average across four weeks with NA.rm
+          mean_pred <- calc(stack(pred$pred_week), function(x) mean(x, na.rm = T))
+          return(mean_pred)
+      }))
+  })
+}
+
+## BRT bin x GAM abun
+Fun_crossENSpredras <- function(m_name, m_tb, ras){
+  ddply(m_tb, ~folds, function(tb){
+    # select env variables from model
+    var_tokeep_bin <- tb %>% 
+      filter(model_name == m_name & family == "bin" & method == "GAM") %>% 
+      pull(model_var)
+    var_tokeep_abu <- tb %>% 
+      filter(model_name == m_name & family == "lognasc" & method == "GAM") %>% 
+      pull(model_var)
+    # model of presence
+    m.bin <- tb %>% 
+      filter(model_name == m_name & family == "bin" & method == "BRT") %>% 
+      pull(model)
+    load(m.bin[[1]])
+    m.bin.m <- mod_brt$model[[1]]
+    # model of abundance
+    m.abu <- tb %>% 
+      filter(model_name == m_name & family == "lognasc" & method == "GAM") %>% 
+      pull(model)
+    load(m.abu[[1]])
+    m.abu.m <- mod_gam
+    # produce predictions per week then average
+    ras %>% 
+      mutate(pred = map(env_ras, function(r){
+        pred <- r %>% 
+          mutate(pred_week = map(data_pred, function(r_week){
+            # calculate log depth (suppres warnings because there are some positive values on the eastern edge of the extent that produce a warning with log(negative))
+            suppressWarnings(r_week$logDEPTH <- calc(r_week$DEPTH, function(x) log(-x)))
+            # get rid of variables in raster that are not in the model
+            r_week_bin <- r_week[[var_tokeep_bin[[1]]]]
+            r_week_abu <- r_week[[var_tokeep_abu[[1]]]]
+            # then make predictions on raster!
+            pred1 <- raster::predict(r_week_bin, m.bin.m, type = "response",
+                                      n.trees = m.bin.m$gbm.call$best.trees)
+            pred2 <- raster::predict(r_week_abu, m.abu.m, type = "response")
+            predH <- pred1 * pred2
+            return(predH)
+        }))
+        # average across four weeks with NA.rm
+        mean_pred <- calc(stack(pred$pred_week), function(x) mean(x, na.rm = T))
+        return(mean_pred)
+      }))
+  })
+}
+
+# create function to turn tibble of rasters into one dataframe that can generate a ggplot
+Fun_meanpredmaps <- function(ras_tb){
+  
+  # transform into sf format
+  d <- ras_tb %>% 
+    mutate(pred_df = map(meanpred, function(r){
+      # turn raster to sf object
+      d <- r %>% 
+        st_as_stars() %>%
+        st_as_sf(as_points = T, crs = 32610) %>% 
+        rename(fit = layer)
+      # add coordinates to dataframe of predictions
+      d[c("x", "y")] <- st_coordinates(d)
+      return(d)
+    })) %>% 
+    mutate(month = month(as.POSIXct(pred_months, format = "X%Y.%m.%d"),
+                        label = TRUE, abbr = TRUE),
+           year = year(as.POSIXct(pred_months, format = "X%Y.%m.%d")),
+           period = paste(month, year)) %>%  
+    dplyr::select(period, month, year, pred_df) %>%
+    # arrange and mutate factor levels so that plots show up in the right order by months 
+    arrange(year, month) %>% 
+    mutate(period = factor(period, levels = unique(period))) %>% 
+    unnest(pred_df)
+  
+  # create facetted maps by year in columns and months in rows
+  g <- ggplot() +
+    geom_tile(data = d, aes(x, y, fill = log(fit + 0.1))) +
+    scale_fill_viridis_b(na.value = "transparent", 
+                         name = "Predicted \nlog NASC",
+                         n.breaks = 6) +  
+    geom_sf(data = iso_sf_utm[iso_sf_utm$g_2020_ %in% c(-200, -1500), ], 
+            col = "grey80", linewidth = 0.1) +
+    geom_sf(data = coast_sf_utm, col = NA, fill = "grey10") +
+    facet_wrap(~period, ncol = n_distinct(d$year), dir = "v") +
+    coord_sf(xlim = c(-30592.78, 561873.5), ylim = c(4150571, 5378175), expand = F) +
+    mon_theme +
+    xlab("") +
+    ylab("") +
+    theme(axis.text.y = element_text(angle = 90, hjust = 0.5),
+          axis.text.x = element_text(hjust = 0.9),
+          text=element_text(face="bold", size=8),
+          legend.key.size = unit(0.8, "lines"),
+          panel.spacing = unit(0.5, "lines"),
+          plot.margin = unit(c(0.1, 0.1, 0.1, 0.1), "cm"))
+    
+    return(g)
+}
+
+# create custom function to run BRTs in a hierarchical approach
+Fun_mybrt <- function(d, v, fam){
+  # find what columns the names of the variables correspond to
+  var_num <- match(v, names(d))
+  var_y <- match("nasc", names(d))
+  # set starting learning rate (usually between 0.01 and 0.001)
+  lr <- 0.01 
+
+  target.trees <- 0 # resets the target trees , make sure set condition to lower than 1000
+
+  while (target.trees < 1000) {
+  
+    mod.brt <- gbm.step(d,
+                     gbm.x = var_num, # Your predictor variables, referring to columns in your data frame
+                     gbm.y = var_y, # Your response variable
+                     family = fam,
+                     n.trees = 50,
+                     bag.fraction = 0.75, # 0.75 is typical for larger dataset, but can increase bag fraction if dataset is small 
+                     plot.main = F,   
+                     learning.rate = lr,
+                     tree.complexity = 2,
+                     verbose = F)  
+  
+    if (object.size(mod.brt) > 0) {    # > 0 = good, check if hasn't crashed
+      target.trees <- mod.brt$gbm.call$best.trees
+    }
+    else {
+      target.trees <- 0  #check if model size is zero 
+    }
+    lr <- lr / 2
+  }
+  out <- tibble(model = list(mod.brt),
+                lr = lr)
+  return(out)
+}
+
+# create facetted average 2018-2022 maps by months for GAM and BRT
+Fun_YearAvgMap <- function(dd, method, group_name){
+    g <- ggplot() +
+      geom_tile(data = dd, aes(x, y, fill = log(fit + 0.1))) + 
+      scale_fill_viridis_b(na.value = "transparent", 
+                         name = "Predicted \nlog NASC",
+                         n.breaks = 6) + 
+      geom_sf(data = iso_sf_utm[iso_sf_utm$g_2020_ %in% c(-200, -1500), ], 
+            col = "grey80", linewidth = 0.1) +
+      geom_sf(data = coast_sf_utm, col = NA, fill = "grey10") +
+      facet_wrap(~month, ncol = 6, dir = "h") +
+      coord_sf(xlim = c(-30592.78, 561873.5), ylim = c(4150571, 5378175), expand = F) +
+      mon_theme +
+      xlab("") +
+      ylab("") +
+      theme(axis.text.y = element_text(angle = 90, hjust = 0.5),
+          axis.text.x = element_text(hjust = 0.9),
+          text=element_text(face="bold", size=8),
+          legend.key.size = unit(0.8, "lines"),
+          panel.spacing = unit(0.5, "lines"),
+          plot.margin = unit(c(0.1, 0.1, 0.1, 0.1), "cm")) +
+      ggtitle(paste(method, group_name))
+    ggsave(g, file = paste0("./Outputs/", method, "_dynlogdep_YearRound_2018-2022_", group_name,".png"), width = 230, height = 150, dpi = 500, units = "mm")
+}
+
+# create facetted average 2018-2022 maps by months for GAM and BRT with Blue whales!!
+Fun_YearAvgMapBL <- function(dd, method, group_name){
+    g <- ggplot() +
+      geom_tile(data = dd, aes(x, y, fill = log(fit + 0.1))) + 
+      scale_fill_viridis_b(na.value = "transparent", 
+                         name = "Predicted \nlog NASC",
+                         n.breaks = 6) + 
+      geom_sf(data = iso_sf_utm[iso_sf_utm$g_2020_ %in% c(-200, -1500), ], 
+            col = "grey80", linewidth = 0.1) +
+      geom_sf(data = coast_sf_utm, col = NA, fill = "grey10") +
+      facet_wrap(~month, ncol = 6, dir = "h") +
+      coord_sf(xlim = c(-30592.78, 561873.5), ylim = c(4150571, 5378175), expand = F) +
+      mon_theme +
+      xlab("") +
+      ylab("") +
+      theme(axis.text.y = element_text(angle = 90, hjust = 0.5),
+          axis.text.x = element_text(hjust = 0.9),
+          text=element_text(face="bold", size=8),
+          legend.key.size = unit(0.8, "lines"),
+          panel.spacing = unit(0.5, "lines"),
+          plot.margin = unit(c(0.1, 0.1, 0.1, 0.1), "cm")) +
+      ggtitle(paste(method, group_name)) +
+      geom_sf(data = bl_df, col = "black", shape = 21, fill = "white", alpha = 0.5)
+    ggsave(g, file = paste0("./Outputs/", method, "_dynlogdep_YearRoundBL_2018-2022_", group_name,".png"), width = 230, height = 150, dpi = 500, units = "mm")
+}
+```
+
+# Running hierarchical SDMs
+## Set up models
+
+### Predictor formulas
+```{r}
+form_chr <- list(
+     "topographic" = " nasc ~
+                   s(DEPTH, k = 5) + 
+                   s(SLOPE, k = 5) + 
+                   s(DIS_CANYON, k = 5)",
+     "dynamic" = "nasc ~ 
+                   s(DEPTH, k = 5) + 
+                   s(DIS_CANYON, k = 5) + 
+                   s(SLOPE, k = 5) + 
+                   s(sst, k = 5) + 
+                   s(ssh, k = 5) + 
+                   s(eke, k = 5) +
+                   s(sshsd, k = 5) + 
+                   s(sstsd, k = 5) + 
+                   s(curl, k = 5) + 
+                   s(ild_05, k = 5) + 
+                   s(bbv_200, k = 5)",
+     "dynamic_logdep" = "nasc ~ 
+                   s(logDEPTH, k = 5) + 
+                   s(DIS_CANYON, k = 5) + 
+                   s(SLOPE, k = 5) + 
+                   s(sst, k = 5) + 
+                   s(ssh, k = 5) + 
+                   s(eke, k = 5) +
+                   s(sshsd, k = 5) + 
+                   s(sstsd, k = 5) + 
+                   s(curl, k = 5) + 
+                   s(ild_05, k = 5) + 
+                   s(bbv_200, k = 5)",
+     "dynamic_chla" = "nasc ~ 
+                   s(DEPTH, k = 5) + 
+                   s(DIS_CANYON, k = 5) + 
+                   s(SLOPE, k = 5) + 
+                   s(sst, k = 5) + 
+                   s(ssh, k = 5) + 
+                   s(sshsd, k = 5) + 
+                   s(sstsd, k = 5) + 
+                   s(eke, k = 5) +
+                   s(curl, k = 5) + 
+                   s(ild_05, k = 5) + 
+                   s(bbv_200, k = 5) +
+                   s(chla, k = 5)",
+     "dynamic_0.6cor" = "nasc ~ 
+                   s(DEPTH, k = 5) + 
+                   s(SLOPE, k = 5) + 
+                   s(sst, k = 5) + 
+                   s(sstsd, k = 5) + 
+                   s(sshsd, k = 5) + 
+                   s(ild_05, k = 5) + 
+                   s(bbv_200, k = 5)")
+model_type <- c("topo", rep("dyn", 4))
+model_var <- list(
+                   c("DEPTH","SLOPE", "DIS_CANYON"),
+                   c("DEPTH","DIS_CANYON", "SLOPE", "sst", "ssh", "sshsd", "sstsd","eke", "curl", "ild_05", "bbv_200"),
+                   c("logDEPTH","DIS_CANYON", "SLOPE", "sst", "ssh", "sshsd","sstsd","eke", "curl", "ild_05", "bbv_200"),
+                   c("DEPTH","DIS_CANYON", "SLOPE", "sst", "ssh", "sshsd", "sstsd","eke", "curl", "ild_05", "bbv_200", "chla"),
+                   c("DEPTH", "SLOPE","sst", "sshsd", "sstsd", "ild_05", "bbv_200"))
+```
+
+### Folds and model types
+```{r}
+load("./Outputs/krill_day_df.RData")
+
+Fun_folding <- function(df){
+  # set seed to NULL so that we can rerun multiple times until we get a combination of folds without zero presence
+  folds <- splitTools::create_folds(df$year_month, k = 9, seed = 1, type = "grouped")
+  d_cv <- llply(folds, function(f){
+    df$fold <- "test"
+    df[f,]$fold <- "train"
+    # reset all data points from winter 202003 to be in the train set
+    # otherwise there is one run of the model training that will not incorporate any winter data
+    df[df$year_month == "202003", ]$fold <- "train"
+    # do not keep the fold that has no test data (the one for which the winter cruise was set back to train instead of test)
+    if(nrow(subset(df, fold == "test")) > 0){
+      return(df)
+    }
+  })
+  # null is returned when if() test above is not met
+  d_cv <- discard(d_cv, is.null)
+  return(d_cv)
+}
+
+krill_day_df <- krill_day_df %>% 
+      mutate(year_month = substr(Date_M, 1, 6)) %>% 
+      mutate(year_month = ifelse(year_month == 201904, 201905, year_month))
+unique(krill_day_df$year_month)
+
+krill_cv <- tibble(folds = paste0("Fold", c(1:8)),
+                   data = Fun_folding(krill_day_df))
+
+modelsH_krill_tb <- tibble(model_form = form_chr) %>%
+    mutate(model_name = names(form_chr),
+         model_type = model_type,
+         model_var = model_var,
+         model_form = map(model_form, as.formula),
+         data = rep(list(krill_cv), length(form_chr))) %>% 
+  unnest(cols = c(data))
+modelsH_krill_tb
+```
+
+### Run models in parallel
+```{r, eval = F}
+modelsH_krill_tb <-  modelsH_krill_tb %>%
+  ## BINOMIAL MODELS
+  mutate(bin = pmap(list(a = data, b = model_var, c = model_form, mn = model_name, fo = folds), .f = function(a, b, c, mn, fo){ 
+      # create data set with binomial response
+      a_modified <- a %>% mutate(nasc = ifelse(nasc == 0, 0, 1))
+      # in the case of GAMs, the explanatory variables should not have NAs
+      a_modified_gam <- a_modified
+    
+      # run models
+      mod_brt <- Fun_mybrt(d = subset(a_modified, fold == "train"), 
+                           v = b, fam = "bernoulli")
+      mod_gam <- gam(c, family = binomial(link = "logit"), 
+                      method = "REML",
+                      select = T,
+                      data = subset(a_modified_gam, fold == "train"))
+      
+      # save models on disk
+      path_brt <- paste0("./Outputs/models/m_brt_bin_", mn, "_", fo, ".RData")
+      save(mod_brt, file = path_brt)
+      path_gam <- paste0("./Outputs/models/m_gam_bin_", mn, "_", fo, ".RData")
+      save(mod_gam, file = path_gam)
+      
+      rm(mod_gam); rm(mod_brt)
+      
+      # return models in a tibble
+      return(tibble(method = c("BRT", "GAM"),
+                    model = list(path_brt, path_gam)))
+    }))
+
+modelsH_krill_tb <- modelsH_krill_tb %>%
+  ## POSITIVE VALUES MODEL
+  mutate(lognasc = pmap(list(a = data, b = model_var, c = model_form, mn = model_name, fo = folds), .f = function(a, b, c, mn, fo){ 
+      # create data set with positive nasc response
+      a_modified_gam <- a %>% 
+                    filter(nasc > 0)
+      # in the case of BRT the log should be applied prior to running the model
+      a_modified_brt <- a %>% 
+                    filter(nasc > 0) %>% 
+                    mutate(nasc = log(nasc)) # apply a log link
+    
+      # run models
+      mod_brt <- Fun_mybrt(d = subset(a_modified_brt, fold == "train"), 
+                           v = b, fam = "gaussian")
+      mod_gam <- gam(c, family = Gamma(link = "log"), 
+                      method = "REML",
+                      select = T,
+                      data = subset(a_modified_gam, fold == "train"))
+      
+      # save models on disk
+      path_brt <- paste0("./Outputs/models/m_brt_lognasc_", mn, "_", fo, ".RData")
+      save(mod_brt, file = path_brt)
+      path_gam <- paste0("./Outputs/models/m_gam_lognasc_", mn, "_", fo, ".RData")
+      save(mod_gam, file = path_gam)
+      
+      rm(mod_gam); rm(mod_brt)
+      
+      # return path to model objects in a tibble
+      return(tibble(method = c("BRT", "GAM"),
+                    model = list(path_brt, path_gam)))
+    
+    })) 
+
+# pivot tibble and calculate deviance explained by each model
+# in training and in test
+modelsH_krill_tb <- modelsH_krill_tb %>%
+  pivot_longer(cols = c(bin, lognasc), names_to = "family", values_to = "mod") %>% 
+  unnest(cols = c(mod))
+
+# correct data depending on family and method
+modelsH_krill_tb <- modelsH_krill_tb %>%
+  mutate(data = pmap(list(d = data, v = model_var, fa = family, m = method), 
+                     function(d, v, fa, m){
+      if(fa == "bin" & m == "BRT"){
+        dd <- d %>% mutate(nasc = ifelse(nasc == 0, 0, 1))
+      }
+      if(fa == "lognasc" & m == "BRT"){
+        dd <- d %>% filter(nasc > 0) %>% mutate(nasc = log(nasc))
+      }
+      if(fa == "bin" & m == "GAM"){
+        dd <- d %>% mutate(nasc = ifelse(nasc == 0, 0, 1))
+        if(!is.null(v)){dd <- dd[complete.cases(dd[v]), ]}
+      }
+      if(fa == "lognasc" & m == "GAM"){
+        dd <- d %>% filter(nasc > 0)
+      }
+      return(dd)
+  }))
+
+save(modelsH_krill_tb, file = "./Outputs/modelsH_krill_tb.RData")
+```
+
+# Model performance
+
+## Performance by method by family
+```{r, warning = F, message = F}
+load("./Outputs/modelsH_krill_tb.RData")
+
+modelsH_krill_perf <- modelsH_krill_tb %>%
+  mutate(dev.exp = pmap_dbl(list(mo = model, me = method), function(mo, me){
+    load(mo)
+    if(me == "BRT"){
+      dev <- round((mod_brt$model[[1]]$self.statistics$mean.null - mod_brt$model[[1]]$cv.statistics$deviance.mean)/mod_brt$model[[1]]$self.statistics$mean.null*100, 1)
+    }
+    if(me == "GAM"){
+      dev <- round(summary(mod_gam)$dev.expl*100, 1)
+    }
+    rm(mo)
+    return(dev)
+  })) %>%
+  # AUC calculation does not depend on method, but can only be done for the bin models
+  mutate(AUC.train = pmap_dbl(list(mo = model, fa = family, d = data, me = method), function(mo, fa, d, me){
+    load(mo)
+    if(me == "BRT"){m <- mod_brt$model[[1]]}
+    if(me == "GAM"){m <- mod_gam}
+    pred.train <- predict(m, subset(d, fold == "train"), type = "response")
+    if(fa == "bin"){
+        auc <- round(pROC::roc(subset(d, fold == "train")$nasc, pred.train)$auc, 3)
+    } else {auc <- NA}
+    return(auc)
+  })) %>%
+  # For the test fold, we calculate either AUC for the bin model, or pear.cor for the lognasc model
+  mutate(metrics.test = pmap(list(mo = model, fa = family, d = data, me = method), function(mo, fa, d, me){
+    load(mo)
+    if(me == "BRT"){m <- mod_brt$model[[1]]}
+    if(me == "GAM"){m <- mod_gam}
+    pred.test <- predict(m, subset(d, fold == "test"), type = "response")
+    if(length(pred.test[!is.na(pred.test)])>2 & 
+       nrow(subset(d, fold == "test" & nasc != 0)) > 1){ # if too many NAs (e.g. in the chla model), then return NA as metrics
+      # and if the test folds contain at least one positive value
+      if(fa == "bin"){
+        # no tspin in test fold07 so cannot compute metrics when response is all zeros
+        auc <- round(pROC::roc(subset(d, fold == "test")$nasc, pred.test)$auc, 3)
+        spea.cor <- NA
+        pear.cor <- NA
+        
+      } else {
+        auc <- NA
+        spea.cor <- round(cor.test(subset(d, fold == "test")$nasc, pred.test, method = "spearman")$estimate, 3)
+        pear.cor <- round(cor.test(subset(d, fold == "test")$nasc, pred.test, method = "pearson")$estimate, 3)
+      }
+    } else { spea.cor <- NA ; auc <- NA ; pear.cor <- NA}
+    metrics <- tibble(spea.cor = spea.cor, pear.cor = pear.cor, AUC.test = auc)
+    return(metrics)
+  })) %>% 
+  unnest(cols = c(metrics.test)) %>% 
+  dplyr::select(model_name, family, method, folds, dev.exp, AUC.train, AUC.test, pear.cor, spea.cor) %>% 
+  arrange(family)
+
+(mean_perf <- modelsH_krill_perf %>% 
+  group_by(model_name, family, method) %>% 
+  summarize(mean.dev.exp = mean(dev.exp, na.rm = T),
+            mean.AUC.train =  mean(AUC.train, na.rm = T),
+            mean.AUC.test = mean(AUC.test, na.rm = T),
+            mean.pear.cor = mean(pear.cor, na.rm = T),
+            mean.spea.cor = mean(spea.cor, na.rm = T)) %>% 
+  mutate_if(is.numeric, ~ round(., digits = 3)) %>% 
+  select(family, everything()) %>% 
+  arrange(family, -mean.dev.exp))
+
+openxlsx::write.xlsx(mean_perf, file = "./Outputs/mean_perf.xlsx", overwrite = T)
+
+```
+
+
+```{r, warning = F, message = F}
+g <- ggplot(mean_perf, aes(x = model_name, y = mean.dev.exp, fill = method)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    facet_wrap(~family) +
+    ylab("Mean deviance explained (8 folds CV) in model of krill presence") +
+    mon_theme +
+    theme(axis.text.x = element_text(angle = 30, hjust = 0.8))
+g
+ggsave(g, file = "./Outputs/modelH_krill_dev.exp.png", width = 150, height = 130, units = "mm", dpi = 600)
+
+g1 <- ggplot(mean_perf, aes(x = model_name, y = mean.AUC.train, fill = method)) +
+    geom_bar(stat = "identity", position = "dodge", show.legend = F) +
+    ylab("Mean AUC on train set (8 folds CV)")
+g2 <- ggplot(mean_perf, aes(x = model_name, y = mean.AUC.test, fill = method)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    ylab("Mean AUC on test set (8 folds CV) in model of krill presence")
+g <- (g1 + g2) & mon_theme &
+    theme(axis.text.x = element_text(angle = 30, hjust = 0.8))
+g
+ggsave(g, file = "./Outputs/modelH_krill_auc.png", width = 150, height = 100, units = "mm", dpi = 600)
+
+g <- ggplot(subset(mean_perf, family == "lognasc"), aes(x = model_name, y = mean.pear.cor, fill = method)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    ylab("Mean Pearson Cor (8 folds CV) in model of krill abundance conditional on presence") +
+    mon_theme +
+    theme(axis.text.x = element_text(angle = 30, hjust = 0.8))
+g
+ggsave(g, file = "./Outputs/modelH_krill_pear.cor.png", width = 150, height = 150, units = "mm", dpi = 600)
+
+g <- ggplot(subset(mean_perf, family == "lognasc"), aes(x = model_name, y = mean.spea.cor, fill = method)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    ylab("Mean Spearman Cor (8 folds CV) in model of krill abundance conditional on presence") +
+    mon_theme +
+    theme(axis.text.x = element_text(angle = 30, hjust = 0.8))
+g
+ggsave(g, file = "./Outputs/modelH_krill_spea.cor.png", width = 150, height = 150, units = "mm", dpi = 600)
+```
+
+# Outputs
+
+## Select model
+Using the best model on average
+```{r, eval = F}
+load("./Outputs/modelsH_krill_tb.RData")
+     
+modelsH_krill_dynlogdep <- modelsH_krill_tb %>% 
+  filter(model_name == "dynamic_logdep")
+
+save(modelsH_krill_dynlogdep, file = "./Outputs/modelsH_krill_dynlogdep.RData")
+```
+
+## Maps of predictions
+
+### Year-round
+
+Predict over all months
+```{r}
+# select combination of months (May, July, September) and years 2016 onwards
+pred_subset <- tidyr::crossing(years = c(2018:2022), months = c(1:12))
+pred_subset <- paste0("X", pred_subset$years, ".", pred_subset$months)
+
+# select only these periods in the full prediction rasters                   
+env_pred_yearround <- env_pred_full %>% 
+  filter(substr(pred_months, 1, 7) %in% pred_subset)
+```
+
+Run predictions
+```{r, eval = F}
+load("./Outputs/modelsH_krill_dynlogdep.RData")
+
+## BRT
+predyear_brtH_dynlogdep <- Fun_Hpredras(m_name = "dynamic_logdep", fam = c("bin","lognasc"), m_tb = modelsH_krill_dynlogdep, ras = env_pred_yearround, met = "BRT")
+save(predyear_brtH_dynlogdep, file = "./Outputs/predyear_brtH_dynlogdep.RData")
+
+predyear_brtHavg_dynlogdep <-  ddply(predyear_brtH_dynlogdep, .(pred_months), function(d){
+  tibble(meanpred = list(calc(stack(d$pred), function(x) mean(x, na.rm = T))))
+})
+save(predyear_brtHavg_dynlogdep, file = "./Outputs/predyear_brtHavg_dynlogdep.RData")
+
+## GAM
+predyear_gamH_dynlogdep <- Fun_Hpredras(m_name = "dynamic_logdep", fam = c("bin","lognasc"), m_tb = modelsH_krill_dynlogdep, ras = env_pred_yearround, met = "GAM")
+save(predyear_gamH_dynlogdep, file = "./Outputs/predyear_gamH_dynlogdep.RData")
+
+predyear_gamHavg_dynlogdep <-  ddply(predyear_gamH_dynlogdep, .(pred_months), function(d){
+  tibble(meanpred = list(calc(stack(d$pred), function(x) mean(x, na.rm = T))))
+})
+save(predyear_gamHavg_dynlogdep, file = "./Outputs/predyear_gamHavg_dynlogdep.RData")
+
+## ENS
+predyear_crossENS_dynlogdep <- Fun_crossENSpredras(m_name = "dynamic_logdep",  m_tb = modelsH_krill_dynlogdep, ras = env_pred_yearround)
+save(predyear_crossENS_dynlogdep, file = "./Outputs/predyear_crossENS_dynlogdep.RData")
+
+predyear_crossENSavg_dynlogdep <- ddply(predyear_crossENS_dynlogdep, .(pred_months), function(d){
+  tibble(meanpred = list(calc(stack(d$pred), function(x) mean(x, na.rm = T))))
+})
+save(predyear_crossENSavg_dynlogdep, file = "./Outputs/predyear_crossENSavg_dynlogdep.RData")
+```
+
+
+### Average by month
+
+From the ensemble model
+```{r, message = F}
+load("./Outputs/predyear_crossENSavg_dynlogdep.RData")
+
+# average by rasters by month and transform into sf format
+predyear_crossENS2_dynlogdep <- predyear_crossENSavg_dynlogdep %>% 
+    mutate(month = month(as.POSIXct(pred_months, format = "X%Y.%m.%d"),
+                        label = TRUE, abbr = TRUE)) %>% 
+    ddply(., .(month), function(d){
+      out <- mean(stack(d$meanpred), na.rm = T) %>% 
+        st_as_stars() %>%
+        st_as_sf(as_points = T, crs = 32610) %>% 
+        rename(fit = layer)
+            # add coordinates to dataframe of predictions
+      out[c("x", "y")] <- st_coordinates(out)
+      return(out)
+    })
+
+# add an extra steps to remove abberant values. those are likely due to extrapolation so something that will have to be fixed better
+# this step is just changing the colors on the map but not affecting the patterns
+# but turns out that rachel's value has nothing to do with ours because we are not integrating nasc over the same boxes. the max in observed nasc is way above the max predicted nasc!!
+max(krill_day_df$nasc)
+log(max(krill_day_df$nasc) +0.1)
+exp(6) # value from rachel's paper
+summary(predyear_crossENS2_dynlogdep$fit)
+predyear_crossENS2_dynlogdep <- predyear_crossENS2_dynlogdep %>% 
+  mutate(fit = ifelse(fit > 500, 500, fit))
+
+#group_map() uses the .y argument, which holds the group keys, to explicitly pass the unique group name to the Fun_YearAvgMap() function for file naming
+predyear_crossENS2_dynlogdep %>%
+  Fun_YearAvgMap(., method = "ENS", group_name = "All krill")
+```
+
+From the BRT hierarchical model
+```{r, message = F}
+load("./Outputs/predyear_brtHavg_dynlogdep.RData")
+
+# average by rasters by month and transform into sf format
+predyear_brtH2_dynlogdep <- predyear_brtHavg_dynlogdep %>% 
+    mutate(month = month(as.POSIXct(pred_months, format = "X%Y.%m.%d"),
+                        label = TRUE, abbr = TRUE)) %>% 
+    ddply(., .(month), function(d){
+      out <- mean(stack(d$meanpred), na.rm = T) %>% 
+        st_as_stars() %>%
+        st_as_sf(as_points = T, crs = 32610) %>% 
+        rename(fit = layer)
+            # add coordinates to dataframe of predictions
+      out[c("x", "y")] <- st_coordinates(out)
+      return(out)
+    })
+
+# the BRT is a better fit in terms of response magnitude than the ensemble model that predicted NASC up to 5000...
+summary(predyear_brtH2_dynlogdep$fit)
+predyear_brtH2_dynlogdep <- predyear_brtH2_dynlogdep %>% 
+  mutate(fit = ifelse(fit > 500, 500, fit))
+
+predyear_brtH2_dynlogdep %>%
+  Fun_YearAvgMap(., method = "BRT", group_name = "All krill")
+```
+
+## Compare to blue whales
+
+Compare predictions to blue whale observations
+```{r}
+load("../../3-ID_count_extract/Outputs/dettot_df.RData")
+bl_opal_df <- dettot_df %>% 
+  filter(sp_code == "BLWH") %>% 
+  mutate(month = lubridate::month(time_pst, label = TRUE, abbr = TRUE),
+         year = year(time_pst),
+         period = paste(month, year)) %>%  
+  dplyr::select(period, month, year, geometry, sp_count)
+
+bl_df <- read.csv("../../../Data/External_validation_data.csv") %>% 
+  filter(Species == "BLWH", Year >= 2016) %>% 
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326) %>% 
+  st_transform(crs = 32610) %>% 
+  mutate(time = ifelse(DateTime_PST != "", substr(DateTime_PST, 1, 10), substr(DateTime_GMT, 1, 10))) %>% 
+  mutate(time = as.POSIXct(time, format = "%Y/%m/%d"),
+         month = lubridate::month(time, label = TRUE, abbr = TRUE),
+         year = year(time),
+         period = paste(month, year)) %>%  
+  rename(sp_count = Count) %>% 
+  dplyr::select(period, month, year, geometry, sp_count) %>% 
+  rbind(bl_opal_df) %>% 
+  mutate(period = factor(period, levels = unique(period)))
+
+
+#group_map() uses the .y argument, which holds the group keys, to explicitly pass the unique group name to the Fun_YearAvgMap() function for file naming
+predyear_brtH2_dynlogdep %>%
+  Fun_YearAvgMapBL(., method = "BRT", group_name = "All krill")
+```
+
+## Month of May across species
+```{r}
+g <- predyear_brtH2_dynlogdep %>% 
+    filter(month == "May") %>%
+    mutate(method = "BRT") %>% 
+  rbind(predyear_crossENS2_dynlogdep %>% 
+    filter(month == "May") %>% 
+    mutate(method = "ENS")) %>% 
+  ggplot(.) +
+      geom_tile(aes(x, y, fill = log(fit + 0.1))) + 
+      scale_fill_viridis_b(na.value = "transparent", 
+                         name = "Predicted \nlog NASC",
+                         n.breaks = 6) + 
+      geom_sf(data = iso_sf_utm[iso_sf_utm$g_2020_ %in% c(-200, -1500), ], 
+            col = "grey80", linewidth = 0.1) +
+      geom_sf(data = coast_sf_utm, col = NA, fill = "grey10") +
+      coord_sf(xlim = c(-30592.78, 561873.5), ylim = c(4150571, 5378175), expand = F) +
+      mon_theme +
+      xlab("") +
+      ylab("") +
+      facet_wrap(~method, ncol = 2) +
+      theme(axis.text.y = element_text(angle = 90, hjust = 0.5),
+          axis.text.x = element_text(hjust = 0.9),
+          text=element_text(face="bold", size=8),
+          legend.key.size = unit(0.8, "lines"),
+          panel.spacing = unit(0.5, "lines"),
+          plot.margin = unit(c(0.1, 0.1, 0.1, 0.1), "cm"))
+ggsave(g, file = "./Outputs/Allkrill_dynlogdep_AvgMay_2018-2022.png", width = 120, height = 110, dpi = 500, units = "mm")
+  
+```
+
+### Across year variability - Feb, May, Sep
+
+Generate maps by month by year
+```{r, fig.width = 15, fig.height = 11, warning = F}
+load("./Outputs/predyear_gamHavg_dynlogdep.RData")
+load("./Outputs/predyear_brtHavg_dynlogdep.RData")
+load("./Outputs/predyear_crossENSavg_dynlogdep.RData")
+
+map_ens <- predyear_crossENSavg_dynlogdep %>% 
+  filter(substr(pred_months, 7, 7) %in% c("2", "5", "9")) %>% 
+  filter(as.numeric(substr(pred_months, 2, 5)) >= 2018) %>%
+  Fun_meanpredmaps()
+ggsave(map_ens, file = "./Outputs/crossENS_dynlogdep_FebMaySep_2018-2022.png", width = 180, height = 180, dpi = 500, units = "mm")
+
+map_gam <- predyear_gamHavg_dynlogdep %>% 
+  filter(substr(pred_months, 7, 7) %in% c("2", "5", "9")) %>% 
+  filter(as.numeric(substr(pred_months, 2, 5)) >= 2018) %>%
+  Fun_meanpredmaps()
+ggsave(map_gam, file = "./Outputs/GAMH_dynlogdep_FebMaySep_2018-2022.png", width = 180, height = 180, dpi = 500, units = "mm")
+
+map_brt <- predyear_brtHavg_dynlogdep %>% 
+  filter(substr(pred_months, 7, 7) %in% c("2", "5", "9")) %>% 
+  filter(as.numeric(substr(pred_months, 2, 5)) >= 2018) %>%
+  Fun_meanpredmaps()
+ggsave(map_brt, file = "./Outputs/BRTH_dynlogdep_FebMaySep_2018-2022.png", width = 180, height = 180, dpi = 500, units = "mm")
+```
+
+
+## Trends in time
+```{r}
+load("./Outputs/predyear_brtHavg_dynlogdep.RData")
+load("./Outputs/predyear_crossENSavg_dynlogdep.RData")
+
+krill_trends <- predyear_brtHavg_dynlogdep %>% 
+    mutate(method = "BRT") %>% 
+  rbind(predyear_crossENSavg_dynlogdep %>% 
+    mutate(method = "ENS"))  %>%
+  mutate(sum_nasc = map_dbl(meanpred, function(r){
+    #r[r > 500] <- 500 # the quick fix for the 2018, 2022 july crazy values!
+    sum(values(r), na.rm = T)
+  })) %>% 
+  dplyr::select(-c(meanpred)) %>% 
+  mutate(month = month(as.POSIXct(pred_months, format = "X%Y.%m.%d"),
+                        label = TRUE, abbr = TRUE),
+           year = as.factor(year(as.POSIXct(pred_months, format = "X%Y.%m.%d"))),
+           period = paste(month, year)) %>% 
+  arrange(method, year, month) %>% 
+  mutate(period = factor(period, levels = unique(period)))
+
+# plots trends by year
+g <- ggplot(krill_trends, aes(month, sum_nasc, color = year, group = year)) +
+  geom_point() +
+  geom_path() +
+  scale_y_sqrt("Summed predicted NASC across the study area") +
+  mon_theme +
+  facet_grid(~method) +
+  theme(axis.text.x = element_text(angle = 45))
+ggsave(g, file = "./Outputs/pred_dynlogdep_trends.png", width = 180, height = 70, dpi = 500, units = "mm")
+
+# plot average across years
+krill_mean_trends <- krill_trends %>% 
+  group_by(method, month) %>%
+  summarize(meansum = mean(sum_nasc),
+            sdsum = sd(sum_nasc)) 
+  
+g <- ggplot(krill_mean_trends, aes(month, meansum, color = method, group = method)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = meansum - sdsum, ymax = meansum + sdsum, col = method)) +
+  geom_path() +
+  ylab("Krill relative abundance across the study area") +
+  mon_theme
+
+ggsave(g, file = "./Outputs/pred_dynlogdep_meantrends.png", width = 180, height = 150, dpi = 500, units = "mm")
+```
+
+## Relationships
+
+### Variable influence
+```{r}
+load("./Outputs/modelsH_krill_dynlogdep.RData")
+
+## GAM
+Fun_VarPVGAM <- function(m){
+  load(m)
+  data.frame(predvar = names(summary(mod_gam)$chi.sq),
+             pv = summary(mod_gam)$s.pv)
+}
+
+Fun_VarInfluGAM <- function(d){
+  data.frame(count0.001 = length(d$pv[d$pv <= 0.001]),
+             count0.01 = length(d$pv[d$pv <= 0.01]),
+             count0.05 = length(d$pv[d$pv <= 0.05]),
+             mean_pvalue = round(mean(d$pv), 3))
+}
+
+influ_gam_dynlogdep <- modelsH_krill_dynlogdep %>% 
+  filter(method == "GAM") %>% 
+  mutate(influence = map(model, function(m) Fun_VarPVGAM(m))) %>% 
+  select(method, family, folds, influence) %>% 
+  unnest(cols = c(influence)) %>% 
+  ddply(., .(method, family, predvar), function(d) Fun_VarInfluGAM(d))
+
+  
+save(influ_gam_dynlogdep, file = "./Outputs/influ_gam_dynlogdep.RData")
+
+
+### BRT
+influ_brt_dynlogdep <- modelsH_krill_dynlogdep %>% 
+  filter(method == "BRT") %>% 
+  mutate(influence = map(model, function(m) {
+    load(m)
+    mod_brt$model[[1]]$contributions})) %>% 
+  select(method, family, folds, influence) %>% 
+  unnest(cols = c(influence)) %>% 
+  group_by(method, family, var) %>% 
+  summarize(meanInf = mean(rel.inf),
+            sdInf = sd(rel.inf)) %>% 
+  rename(predvar = var)
+
+save(influ_brt_dynlogdep, file = "./Outputs/influ_brt_dynlogdep.RData")
+
+```
+
+```{r}
+influ_gam_plot <- ddply(influ_gam_dynlogdep, .(family), function(d){
+  d <- d %>%  
+    dplyr::select(-c(method, family, mean_pvalue)) %>% 
+    t %>% # transpose columns
+    as.data.frame() %>% 
+    rownames_to_column()
+  names(d) <- d[1,]
+  d <- d[-1,]
+  d <- d %>% 
+    dplyr::rename(thresh = predvar, "DEPTH" = "s(logDEPTH)", "CANYON" = "s(DIS_CANYON)", 
+           "SLOPE" ="s(SLOPE)", "BBV" = "s(bbv_200)", 
+           "CURL" = "s(curl)", "ILD" = "s(ild_05)", "SSHSD" = "s(sshsd)", 
+           "SSH" = "s(ssh)", "SSTSD" = "s(sstsd)", "SST" = "s(sst)",
+           "EKE" = "s(eke)") %>% 
+    select(thresh, DEPTH, CANYON, SLOPE, BBV, ILD, CURL, SST, SSH, SSHSD, SSTSD, EKE)
+  # convert back to numeric
+  a <- sapply(d[, names(d)[-1]], as.numeric)
+  d <- cbind(d["thresh"], as.data.frame(a))
+  return(d)
+})
+
+png("./Outputs/influ_gam_bin_dynlogdep.png", res = 600, units = "mm", width = 80, height = 80)
+op <- par(mar = c(0.2, 0.2, 2, 0.2))
+par(mfrow = c(1,1))
+d <- influ_gam_plot %>%
+  filter(family == "bin") %>% 
+  column_to_rownames("thresh") %>% 
+  dplyr::select(-c(family)) %>% 
+  dplyr::arrange(desc(row_number()))
+d <- rbind(rep(10, ncol(d)) , rep(0, ncol(d)) , d)
+radarchart(d, seg = 5, axistype=1, 
+             pcol = "#00BFC4", 
+             plwd=1.5,  plty=1, cglcol="grey", cglty=1,
+             axislabcol="grey25", cglwd=0.8, vlcex=1,
+             pfcol = scales::alpha("#00BFC4", 0.4),
+             caxislabels = c(0, 2, 4, 6, 8, ''),
+             palcex = 0.8)
+dev.off()
+
+png("./Outputs/influ_gam_abundance_dynlogdep.png", res = 600, units = "mm", width = 80, height = 80)
+op <- par(mar = c(0.2, 0.2, 2, 0.2))
+par(mfrow = c(1,1))
+d <- influ_gam_plot %>%
+  filter(family == "lognasc") %>% 
+  column_to_rownames("thresh") %>% 
+  dplyr::select(-c(family)) %>% 
+  dplyr::arrange(desc(row_number()))
+d <- rbind(rep(10, ncol(d)) , rep(0, ncol(d)) , d)
+radarchart(d, seg = 5, axistype=1, 
+             pcol = "#00BFC4", 
+             plwd=1.5,  plty=1, cglcol="grey", cglty=1,
+             axislabcol="grey25", cglwd=0.8, vlcex=1,
+             pfcol = scales::alpha("#00BFC4", 0.4),
+             caxislabels = c(0, 2, 4, 6, 8, ''),
+             palcex = 0.8)
+dev.off()
+```
+
+```{r}
+influ_brt_plot <- ddply(influ_brt_dynlogdep, .(family), function(d){
+  d <- d %>% 
+    ungroup() %>% 
+    dplyr::select(-c(method, family, sdInf)) %>% 
+    t %>% # transpose columns
+    as.data.frame() %>% 
+    rownames_to_column()
+  names(d) <- d[1,]
+  d <- d[-1,]
+  d <- d %>% 
+    rename("CANYON" = "DIS_CANYON", "BBV" = "bbv_200", 
+           "CURL" = "curl", "ILD" = "ild_05", "SSHSD" = "sshsd", 
+           "SSH" = "ssh", "SSTSD" = "sstsd", "SST" = "sst", "EKE" = "eke", "DEPTH" = "logDEPTH") %>% 
+    select(predvar, DEPTH, CANYON, SLOPE, BBV, ILD, CURL, SST, SSH, SSHSD, SSTSD, EKE)
+  # convert back to numeric
+  a <- sapply(d[, names(d)[-1]], as.numeric)
+  return(a)
+})
+
+png("./Outputs/influ_brt_bin_dynlogdep.png", res = 600, units = "mm", width = 80, height = 80)
+op <- par(mar = c(0.2, 0.2, 2, 0.2))
+par(mfrow = c(1,1))
+d <- influ_brt_plot %>%
+  filter(family == "bin") %>%
+  dplyr::select(-c(family)) %>% 
+  dplyr::arrange(desc(row_number()))
+d <- rbind(rep(25, ncol(d)) , rep(0, ncol(d)) , d)
+radarchart(d, seg = 5, axistype=1, 
+             pcol = "#F8766D", 
+             plwd=1.5,  plty=1, cglcol="grey", cglty=1,
+             axislabcol="grey25", cglwd=0.8, vlcex=1,
+             pfcol = scales::alpha("#F8766D", 0.7),
+             caxislabels = c(0, 5, 10, 15, 20, 25),
+             palcex = 0.8)
+dev.off()
+
+png("./Outputs/influ_brt_abundance_dynlogdep.png", res = 600, units = "mm", width = 80, height = 80)
+op <- par(mar = c(0.2, 0.2, 2, 0.2))
+par(mfrow = c(1,1))
+d <- influ_brt_plot %>%
+  filter(family == "lognasc") %>%
+  dplyr::select(-c(family)) %>% 
+  dplyr::arrange(desc(row_number()))
+d <- rbind(rep(25, ncol(d)) , rep(0, ncol(d)) , d)
+radarchart(d, seg = 5, axistype=1, 
+             pcol = "#F8766D", 
+             plwd=1.5,  plty=1, cglcol="grey", cglty=1,
+             axislabcol="grey25", cglwd=0.8, vlcex=1,
+             pfcol = scales::alpha("#F8766D", 0.7),
+             caxislabels = c(0, 5, 10, 15, 20, 25),
+             palcex = 0.8)
+dev.off()
+```
+
+
+### Partial Dependence plots
+
+#### ENS
+```{r}
+load("./Outputs/krill_day_df.RData")
+
+# create a dataframe filled with the average of each variable
+# ignore warning
+mean_pred_df <- krill_day_df %>% 
+    dplyr::select(modelsH_krill_dynlogdep$model_var[[1]]) %>% 
+    summarise_if(is.numeric, function(x) rep(mean(x, na.rm = T), 200))
+
+# for depth I am fixing the mean to 200 m instead of the mean which is about 400 m
+mean_pred_df$logDEPTH <- log(200)
+
+# run predictions over model type and folds
+ENScurves_krill_dynlogdep <- modelsH_krill_dynlogdep %>% 
+  filter((method == "BRT" & family == "bin") | (method == "GAM" & family == "lognasc")) %>% 
+  mutate(pred = map2(model, method, function(m, me){
+    load(m)
+    if(me == "BRT"){
+      m <- mod_brt$model[[1]]
+      var_selec <- m$contributions %>% 
+        filter(rel.inf > 5)
+    }
+    if(me == "GAM"){
+      m <- mod_gam
+      var_selec <- data.frame(predvar = names(summary(m)$chi.sq),
+                        pv = summary(m)$s.pv) %>% 
+        filter(pv <= 0.05) %>% 
+        mutate(var = substr(predvar, 3, (nchar(predvar)-1)))
+    }
+    new_pred <- ddply(var_selec, ~var, function (v){ # for each predictor, calculate response with model m
+        extremes <- quantile(krill_day_df[v$var[1]][,1], probs = c(0.01, 0.99), na.rm = T)
+        mean_pred_x_df <- mean_pred_df
+        mean_pred_x_df[,v$var[1]] <- seq(extremes[1], extremes[2], length.out = 200)
+        if(me == "BRT"){
+          pred <- data.frame(fit = raster::predict(m, mean_pred_x_df, type = "response",
+                                      n.trees = m$gbm.call$best.trees))
+          pred$se.fit <- NA # no error estimate in the BRT
+        }
+        if(me == "GAM"){
+          pred <- dismo::predict(m, mean_pred_x_df, type = "response", se.fit = T)
+        }
+        new_pred_df <- data.frame(x = mean_pred_x_df[, v$var[1]])
+        names(new_pred_df) <- "x"
+        new_pred_df$predvar <- v$var[1]
+        new_pred_df$fit <- pred$fit
+        new_pred_df$se <- pred$se.fit
+      return(new_pred_df)
+    })
+  }))
+
+ENScurves_krill_dynlogdep <- ENScurves_krill_dynlogdep %>% 
+  select(family, folds, pred) %>% 
+  unnest(cols = c(pred))
+
+save(ENScurves_krill_dynlogdep, file = "./Outputs/ENScurves_krill_dynlogdep.RData")
+
+g1 <- ENScurves_krill_dynlogdep %>% 
+  filter(family == "bin") %>% 
+  mutate(id = paste(folds, sep = "_"),
+         predvar = car::recode(predvar, "'DIS_CANYON' = 'CANYON'; 'bbv_200' = 'BBV'; 
+           'curl' = 'CURL'; 'ild_05' = 'ILD'; 'sshsd'='SSHSD'; 
+           'ssh' = 'SSH';  'sstsd' = 'SSTSD';'sst' = 'SST'; 'eke' = 'EKE';
+           'logDEPTH' = 'DEPTH'")) %>% 
+  mutate(predvar = factor(predvar, levels = c("DEPTH",  "CANYON", "SLOPE", "BBV", "ILD", "CURL", "SST", "SSH", "SSHSD", "SSTSD", "EKE"))) %>% 
+  ggplot(aes(x, fit, group = id)) +
+      geom_path(linewidth = 0.8, alpha = 0.9, col = "#00BFC4") +
+      facet_wrap(~predvar, scales = "free", ncol = 4) + #labeller = labeller(predvar = labels_predvar)
+      ylab("Probability of krill presence (BRT)") +
+      xlab("Environmental predictors") +
+      mon_theme +
+      theme(legend.key.size = unit(1.0, "lines"),
+        legend.position = "bottom",
+        strip.background = element_rect(color = "black", fill = "white", linewidth = 0.5, linetype = "solid"))
+
+ggsave(g1, file = "./Outputs/ENScurves_krill_dynlogdep_bin.png", width = 180, height = 120, dpi = 300, units = "mm")
+
+g2 <- ENScurves_krill_dynlogdep %>% 
+  filter(family == "lognasc") %>% 
+  mutate(id = folds,
+         predvar = car::recode(predvar, "'DIS_CANYON' = 'CANYON'; 'bbv_200' = 'BBV'; 
+           'curl' = 'CURL'; 'ild_05' = 'ILD'; 'sshsd'='SSHSD'; 
+           'ssh' = 'SSH';  'sstsd' = 'SSTSD';'sst' = 'SST'; 'eke' = 'EKE';
+           'logDEPTH' = 'DEPTH'")) %>% 
+  mutate(predvar = factor(predvar, levels = c("DEPTH",  "CANYON", "SLOPE", "BBV", "ILD", "CURL", "SST", "SSH", "SSHSD", "SSTSD", "EKE"))) %>% 
+  ggplot(aes(x, fit, group = id)) +
+      geom_path(linewidth = 0.8, alpha = 0.9, col = "#00BFC4") +
+      facet_wrap(~predvar, scales = "free", ncol = 4) + 
+      ylab("Krill abundance conditional on presence (GAM)") +
+      xlab("Environmental predictors") +
+      mon_theme +
+      theme(legend.key.size = unit(1.0, "lines"),
+        legend.position = "bottom",
+        strip.background = element_rect(color = "black", fill = "white", linewidth = 0.5, linetype = "solid"))
+
+ggsave(g2, file = "./Outputs/ENScurves_krill_dynlogdep_abu.png", width = 180, height = 120, dpi = 300, units = "mm")
+```
+
+#### BRT
+
+```{r}
+load("./Outputs/krill_day_df.RData")
+
+# create a dataframe filled with the average of each variable
+# ignore warning
+mean_pred_df <- krill_day_df %>% 
+    dplyr::select(modelsH_krill_dynlogdep$model_var[[1]]) %>% 
+    summarise_if(is.numeric, function(x) rep(mean(x, na.rm = T), 200))
+
+# for depth I am fixing the mean to 200 m instead of the mean which is about 400 m
+mean_pred_df$logDEPTH <- log(200)
+
+# run predictions over model type and folds
+BRTcurves_krill_dynlogdep <- modelsH_krill_dynlogdep %>% 
+  filter(method == "BRT") %>% 
+  mutate(pred = map2(model, method, function(m, me){
+    load(m)
+    m <- mod_brt$model[[1]]
+    var_selec <- m$contributions %>% 
+        filter(rel.inf > 5)
+    new_pred <- ddply(var_selec, ~var, function (v){ # for each predictor, calculate response with model m
+        extremes <- quantile(krill_day_df[v$var[1]][,1], probs = c(0.01, 0.99), na.rm = T)
+        mean_pred_x_df <- mean_pred_df
+        mean_pred_x_df[,v$var[1]] <- seq(extremes[1], extremes[2], length.out = 200)
+        pred <- data.frame(fit = raster::predict(m, mean_pred_x_df, type = "response",
+                                      n.trees = m$gbm.call$best.trees))
+        pred$se.fit <- NA # no error estimate in the BRT
+        new_pred_df <- data.frame(x = mean_pred_x_df[, v$var[1]])
+        names(new_pred_df) <- "x"
+        new_pred_df$predvar <- v$var[1]
+        new_pred_df$fit <- pred$fit
+        new_pred_df$se <- pred$se.fit
+      return(new_pred_df)
+    })
+  }))
+
+BRTcurves_krill_dynlogdep <- BRTcurves_krill_dynlogdep %>% 
+  select(family, folds, pred) %>% 
+  unnest(cols = c(pred))
+
+save(BRTcurves_krill_dynlogdep, file = "./Outputs/BRTcurves_krill_dynlogdep.RData")
+
+g1 <- BRTcurves_krill_dynlogdep %>% 
+  filter(family == "bin") %>% 
+  mutate(id = folds,
+         predvar = car::recode(predvar, "'DIS_CANYON' = 'CANYON'; 'bbv_200' = 'BBV'; 
+           'curl' = 'CURL'; 'ild_05' = 'ILD'; 'sshsd'='SSHSD'; 
+           'ssh' = 'SSH';  'sstsd' = 'SSTSD';'sst' = 'SST'; 'eke' = 'EKE';
+           'logDEPTH' = 'DEPTH'")) %>% 
+  mutate(predvar = factor(predvar, levels = c("DEPTH",  "CANYON", "SLOPE", "BBV", "ILD", "CURL", "SST", "SSH", "SSHSD", "SSTSD", "EKE"))) %>% 
+  ggplot(aes(x, fit, group = id)) +
+      geom_path(linewidth = 0.8, alpha = 0.9, col = "#F8766D") +
+      facet_wrap(~predvar, scales = "free", ncol = 4) + #labeller = labeller(predvar = labels_predvar)
+      ylab("Probability of krill presence (BRT)") +
+      xlab("Environmental predictors") +
+      mon_theme +
+      theme(legend.key.size = unit(1.0, "lines"),
+        legend.position = "bottom",
+        strip.background = element_rect(color = "black", fill = "white", linewidth = 0.5, linetype = "solid"))
+
+ggsave(g1, file = "./Outputs/BRTcurves_krill_dynlogdep_bin.png", width = 180, height = 120, dpi = 300, units = "mm")
+
+g2 <- BRTcurves_krill_dynlogdep %>% 
+  filter(family == "lognasc") %>% 
+  mutate(id = folds,
+         predvar = car::recode(predvar, "'DIS_CANYON' = 'CANYON'; 'bbv_200' = 'BBV'; 
+           'curl' = 'CURL'; 'ild_05' = 'ILD'; 'sshsd'='SSHSD'; 
+           'ssh' = 'SSH';  'sstsd' = 'SSTSD';'sst' = 'SST'; 'eke' = 'EKE';
+           'logDEPTH' = 'DEPTH'")) %>% 
+  mutate(predvar = factor(predvar, levels = c("DEPTH",  "CANYON", "SLOPE", "BBV", "ILD", "CURL", "SST", "SSH", "SSHSD", "SSTSD", "EKE"))) %>% 
+  ggplot(aes(x, fit, group = id)) +
+      geom_path(linewidth = 0.8, alpha = 0.9, col = "#F8766D") +
+      facet_wrap(~predvar, scales = "free", ncol = 4) + #labeller = labeller(predvar = labels_predvar)
+      ylab("Krill abundance conditional on presence (BRT)") +
+      xlab("Environmental predictors") +
+      mon_theme +
+      theme(legend.key.size = unit(1.0, "lines"),
+        legend.position = "bottom",
+        strip.background = element_rect(color = "black", fill = "white", linewidth = 0.5, linetype = "solid"))
+
+ggsave(g2, file = "./Outputs/BRTcurves_krill_dynlogdep_abu.png", width = 180, height = 120, dpi = 300, units = "mm")
+```
+
+# Understand the "june-dip"!
+
+```{r}
+# select only the months of May, June, and July
+pred_subset <- tidyr::crossing(years = c(2018:2022), months = c(5, 6, 7))
+pred_subset <- paste0("X", pred_subset$years, ".", pred_subset$months)
+
+# calculate the min, max, and mean per layer per week
+env_pred_june <- env_pred_full %>% 
+  filter(substr(pred_months, 1, 7) %in% pred_subset) %>% 
+  mutate(month = substr(pred_months, 7, 7)) %>% 
+  mutate(sum = map(env_ras, function(r){
+       r %>% 
+          mutate(env_week = map(data_pred, function(r_week){
+            values_week <- values(r_week)
+            tibble(var = names(r_week),
+                  min = minValue(r_week),
+                  max = maxValue(r_week),
+                  mean = colMeans(values_week, na.rm=T))
+          })) %>% 
+          select(week_names, env_week) %>% 
+          unnest(cols = env_week)
+      })) %>% 
+  select(pred_months, month, sum) %>% 
+  unnest(sum) %>% 
+  filter(var %in% c("sst", "ssh", "sshsd", "sstsd","eke", "curl", "ild_05", "bbv_200")) %>% 
+  mutate(year = substr(pred_months, 2, 5))
+
+g <- ggplot(env_pred_june, aes(month, mean)) +
+  geom_pointrange(aes(ymin = min, ymax = max, color = as.factor(year)), position = "jitter") +
+  facet_wrap(~var, scales = "free_y") +
+  mon_theme
+
+ggsave(g, file = "./Outputs/Env_var_weekly_june.png", width = 180, height = 150, dpi = 500, units = "mm")
+
+g <- ggplot(env_pred_june, aes(month, mean)) +
+  geom_boxplot() +
+  facet_wrap(~var, scales = "free_y") +
+  mon_theme
+
+ggsave(g, file = "./Outputs/Env_var_monthly_meanbox_june.png", width = 150, height = 150, dpi = 500, units = "mm")
+
+g <- ggplot(env_pred_june, aes(month, max)) +
+  geom_boxplot() +
+  facet_wrap(~var, scales = "free_y") +
+  mon_theme
+
+ggsave(g, file = "./Outputs/Env_var_monthly_maxbox_june.png", width = 150, height = 150, dpi = 500, units = "mm")
+
+# in 2021 the june dip was the most marked
+g <- ggplot(subset(env_pred_june, year == "2021"), aes(month, max)) +
+  geom_boxplot() +
+  facet_wrap(~var, scales = "free_y") +
+  mon_theme
+
+ggsave(g, file = "./Outputs/Env_var_monthly_maxbox_2021_june.png", width = 150, height = 150, dpi = 500, units = "mm")
+
+# look into bbv and ild more closely... they might be the culprits of the june dip
+g1 <- ggplot(subset(env_pred_june, var %in% c("bbv_200", "ild_05")), aes(month, max)) +
+  geom_boxplot(aes(col = as.factor(year))) +
+  facet_wrap(~var, scales = "free_y") +
+  mon_theme +
+  ggtitle("Max values across study region")
+g2 <- ggplot(subset(env_pred_june, var %in% c("bbv_200", "ild_05")), aes(month, mean)) +
+  geom_boxplot(aes(col = as.factor(year))) +
+  facet_wrap(~var, scales = "free_y") +
+  mon_theme +
+  ggtitle("Mean values across study region")
+g <- g1 / g2
+ggsave(g, file = "./Outputs/Env_var_monthly_maxbox_bbv_june.png", width = 150, height = 150, dpi = 500, units = "mm")
+```
+
+Investigate the high bbv_200 and low ild hypothesis to explain the june dip...
+```{r}
+Fun_MapRasEnv <- function(tb, pred_subset, var){
+  tb %>% 
+    filter(substr(pred_months, 1, 7) %in% pred_subset) %>% 
+    mutate(month = substr(pred_months, 7, 7)) %>% 
+    mutate(year = substr(pred_months, 2, 5)) %>% 
+    mutate(ras = map(env_ras, function(r){
+       r %>% 
+          mutate(env_week = map(data_pred, function(r_week){
+            r_week_selec <- r_week[[var]]
+            d <- r_week_selec %>% 
+                st_as_stars() %>%
+                st_as_sf(as_points = T, crs = 32610)
+            d[c("x", "y")] <- st_coordinates(d)
+            return(d)
+          })) %>% 
+        select(week_names, env_week) %>% 
+        unnest(cols = env_week)
+        })) %>% 
+    dplyr::select(pred_months, month, year, ras) %>% 
+    unnest(ras) %>% 
+    mutate(week = substr(week_names, 1, 3))
+}
+
+#################################
+############################ BBV
+
+bbv_df <- Fun_MapRasEnv(env_pred_full, pred_subset, var = "bbv_200") %>%
+  filter(!is.na(bbv_200)) %>% 
+  mutate(week = factor(week, levels = c("X1X", "X8X", "X15", "X22")))
+
+# look at 2021 because that's when the june dip was the strongest
+g <- ggplot(subset(bbv_df, year == 2021)) +
+  geom_tile(aes(x, y, fill = bbv_200)) +
+  scale_fill_viridis(option = "C") +
+  facet_grid(month~week) +
+  coord_fixed() +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank())
+ggsave(g, file = "./Outputs/bbv_june_by_week_2021.png", width = 180, height = 210, dpi = 500, units = "mm")
+
+#################################
+############################ ILD
+
+ild_df <- Fun_MapRasEnv(env_pred_full, pred_subset, var = "ild_05") %>%
+  filter(!is.na(ild_05)) %>% 
+  mutate(week = factor(week, levels = c("X1X", "X8X", "X15", "X22")))
+
+g <- ggplot(subset(ild_df, year == 2021)) +
+  geom_tile(aes(x, y, fill = ild_05)) +
+  scale_fill_viridis(option = "C") +
+  facet_grid(month~week) +
+  coord_fixed() +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank())
+ggsave(g, file = "./Outputs/ild_june_by_week_2021.png", width = 180, height = 210, dpi = 500, units = "mm")
+```
+
+
+Where is the abundance dropping in June compared to May and July?
+```{r}
+load("./Outputs/predyear_crossENSavg_dynlogdep.RData")
+
+pred_anomaly <- predyear_crossENSavg_dynlogdep %>% 
+  filter(substr(pred_months, 1, 7) %in% pred_subset) %>% 
+  mutate(month = substr(pred_months, 7, 7)) %>% 
+  mutate(year = substr(pred_months, 2, 5)) %>% 
+  ddply(., ~year, function(tb){
+    r_may <- tb %>% filter(month == 5) %>% pull(meanpred)
+    r_june <- tb %>% filter(month == 6) %>% pull(meanpred)
+    r_july <- tb %>% filter(month == 7) %>% pull(meanpred)
+    r_may_anomaly <- stack(list(r_may[[1]], r_june[[1]], r_july[[1]]))
+    names(r_may_anomaly) <- c("may","june", "july")
+    d <- r_may_anomaly %>% 
+      st_as_stars() %>%
+      st_as_sf(as_points = T, crs = 32610)
+      d[c("x", "y")] <- st_coordinates(d)
+    return(d)
+  }) %>%
+  dplyr::select(year, x, y, may, june, july) %>% 
+  mutate(percent_june_change = (june-may) / (may + june) * 100,
+         percent_july_change = (july-may) / (may + july) * 100)
+
+
+g <- ggplot(pred_anomaly) +
+  geom_tile(aes(x, y, fill = percent_june_change)) +
+  scale_fill_gradient2(low = "royalblue", high = "red",
+                       name = "Prediction difference\nJune - May") +
+  facet_wrap(~year, ncol = 5) +
+  coord_fixed() +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank())
+ggsave(g, file = "./Outputs/june_anomaly_to_may.png", width = 200, height = 100, dpi = 500, units = "mm")
+
+g <- ggplot(pred_anomaly) +
+  geom_tile(aes(x, y, fill = percent_july_change)) +
+  scale_fill_gradient2(low = "royalblue", high = "red",
+                       name = "Prediction difference\nJuly - May") +
+  facet_wrap(~year, ncol = 5) +
+  coord_fixed() +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank())
+ggsave(g, file = "./Outputs/july_anomaly_to_may.png", width = 200, height = 100, dpi = 500, units = "mm")
+```
+

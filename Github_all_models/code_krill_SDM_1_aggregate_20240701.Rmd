@@ -1,0 +1,459 @@
+---
+title: "Krill acoustic data exploration - OPAL"
+author: "Solene Derville"
+date: "`r format(Sys.time(), '%d %B, %Y, %H:%M')`"
+output: 
+   html_document:
+    highlight: pygments
+    keep_md: yes
+    number_sections: true
+    toc: true
+    toc_float:
+      collapsed: false
+---
+
+```{r, echo=F, result="hide", include=F}
+lib=lapply(c("plyr","officer","readxl","raster","stars", "sf", "viridis", "ggthemes", "patchwork", "tidyverse", "lubridate", "data.table", "suncalc", "mgcv", "gratia"), library, character.only=T)
+
+mon_theme <- theme(
+        panel.border = element_rect(linewidth=0.5,color="black", fill="transparent"),
+        plot.margin=unit(c(2,2,2,2),"mm"),
+        panel.background = element_rect(fill = 'white'),
+        text=element_text(face="bold", size=8),
+        title = element_text(size=rel(1.2)))
+```
+
+Extent of training area
+```{r}
+extent_study_area <-  extent(-129, -122.3, 37.5, 48.4)
+polygon_study_area <- as(extent_study_area, 'SpatialPolygons')
+df_study_area <- fortify(polygon_study_area)
+```
+
+Topography
+```{r}
+## shapefiles
+coast_sf <- st_read("../../Data/Environment/coast_openstreetmap_WA-OR-CA.shp")
+coast_sf_utm <- st_transform(coast_sf, crs = 32610)
+
+# load manually "simplified" coastline made on QGIS from which I removed the bays/estuaries excluded from analysis
+coast_simplified <- st_read("../../Data/Environment/coast_simplified_WA-OR-CA.shp", crs = 4326) %>% 
+  st_transform(crs = 32610) %>%
+  filter(!st_is_empty(.))
+
+## rasters
+load("../../Data/Environment/env_stack.RData")
+
+## isobaths
+iso_sf <- st_read("../../Data/Environment/isobaths_50mto1500m.shp")
+iso1500_sf <- st_read("../../Data/Environment/iso_sf1500.shp")
+
+## coastline simplified (removes inland waters)
+coast_simplified <- st_read("../../Data/Environment/coast_simplified_WA-OR-CA.shp", crs = 4326) %>% 
+  st_transform(crs = 32610) %>%
+  filter(!st_is_empty(.))
+```
+
+# High resolution NASC
+
+```{r}
+# read csv files
+raw_df <- list.files("../Data/Exported krill acoustic data_20230428", full.names = T) %>% 
+  keep(~ !str_detect(.x, ".regions.")) %>% 
+  ldply(., fread) %>% # trying some data.table functions to speed up the code... and it works damn well
+  data.table()
+
+# remove duplicated rows in case there was some overlap in the echoview export files
+raw_df <- unique(raw_df, by = c("Time_M", "Date_M", "Layer")) 
+
+# remove the surface layers > 30 m
+raw_df <- raw_df[Layer_depth_min >= 30,]
+
+# select columns of interest for a full water column summed analysis
+col <- c("Date_M", "Time_M", "NASC", "Lat_M", "Lon_M")
+sum_df <- raw_df[, ..col] %>% 
+  rename("lat" = "Lat_M", "lon" = "Lon_M") # change names of columns for suncalc package to work
+sum_df
+
+# check NASC values
+summary(sum_df$NASC)
+
+# sum NASC throughout water column
+sum_df <- sum_df[, .(NASC = sum(NASC), nb_depth_layers = length(NASC)), .(Date_M, Time_M, lat, lon)]
+sum_df
+
+# check that the number of layers is consistent with the depth of the echosounder signal (x 10)
+summary(sum_df$nb_depth_layers)
+```
+
+# Environmental covariates
+
+## Day and night
+
+```{r}
+# add date in date format
+sum_df <- sum_df[, date := as.Date(as.character(Date_M), format = "%Y%m%d", tz = "GMT")] #add GMT date as Date
+
+# remove abberant lon and lat
+sum_df <- sum_df[lon != 999,]
+
+# dataframe is an easier format for suncalc...
+sum_df <- as.data.frame((sum_df))
+sum_df[c("sunrise", "sunset")] <- getSunlightTimes(data = sum_df[,c("date", "lat", "lon")])[c("sunrise", "sunset")]
+
+# categorize in day and night 1 hour before and after sunset (removing data in twilight)
+sum_df <- sum_df %>% 
+  mutate(time_GMT = as.POSIXct(paste(Date_M, Time_M), format = "%Y%m%d %H:%M:%S", tz = "GMT"),
+         phase = case_when(time_GMT > sunrise + 3600 & time_GMT < sunset - 3600 ~ "day",
+                           time_GMT < sunrise - 3600 | time_GMT > sunset + 3600 ~ "night",
+                           (time_GMT >= sunrise - 3600 & time_GMT <= sunrise + 3600) | 
+                           (time_GMT >= sunset - 3600 & time_GMT <= sunset + 3600) ~ "twilight")) %>% 
+  filter(phase != "twilight")
+
+# check out an example for the NCC 2018 May cruise
+ggplot(subset(sum_df, substr(Date_M, 1, 6) == "201805"), aes(lon, lat, col = phase)) +
+  geom_point() +
+  coord_fixed()
+```
+
+
+## Topography
+
+```{r, fig.height = 10, fig.width = 10}
+# extract topographic variables from raster stack
+sum_sf <- sum_df %>% 
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) %>% 
+  st_transform(crs = 32610) %>% 
+  cbind(., raster::extract(x = env_stack, y =.))
+
+# a couple of values not acquired because points are too coastal (bay)
+sum_sf <- sum_sf %>% 
+  filter(!is.na(DEPTH))
+
+# explore relations between sum NASC and topography
+g1 <- ggplot(sum_sf, aes(SLOPE, log(NASC+0.1))) + geom_hex(binwidth = c(0.005, 0.5))
+g2 <- ggplot(sum_sf, aes(DEPTH, log(NASC+0.1))) + geom_hex(binwidth = c(10, 0.5))
+g3 <- ggplot(sum_sf, aes(DIS_CANYON, log(NASC+0.1))) + geom_hex(binwidth = c(1, 0.5))
+g4 <- ggplot(sum_sf, aes(ASPECT, log(NASC+0.1))) + geom_hex(binwidth = c(0.5, 0.5))
+
+g <- (g1 + g2) / (g3 + g4) &
+  scale_fill_viridis_c(option = "plasma")
+g
+
+g1 <- ggplot(sum_sf, aes(SLOPE, log(NASC+0.1))) 
+g2 <- ggplot(sum_sf, aes(DEPTH, log(NASC+0.1))) 
+g3 <- ggplot(sum_sf, aes(DIS_CANYON, log(NASC+0.1)))
+g4 <- ggplot(sum_sf, aes(ASPECT, log(NASC+0.1)))
+
+g <- (g1 + g2) / (g3 + g4) &
+  geom_point(aes(col = log(NASC+0.1)), alpha = 0.4) &
+  scale_color_viridis_c(option = "plasma") &
+  geom_smooth()
+g
+```
+
+Categorize data into shelf / slope / open waters
+```{r}
+# could refine these criteria but for now I will use shelf up to 200 m, and slope up to 1500 m
+sum_sf <- sum_sf %>% 
+  st_join(iso1500_sf, join = st_intersects) %>% 
+  mutate(habitat = case_when(FID == 0 & DEPTH >= -200 ~ "shelf", 
+                             FID == 0 & DEPTH < -200 ~ "slope",
+                             is.na(FID) ~ "open ocean")) %>% 
+  dplyr::select(-FID)
+
+# plot NASC by habitat
+ggplot(sum_sf, aes(habitat, log(NASC+0.1))) +
+  geom_violin(aes(fill = phase))
+```
+
+
+# Vertical migration
+
+## Spatial data proximity
+
+```{r, fig.width = 7, message = F}
+# loop in a tibble to create grids of increasingly coarser resolutions
+vmigration_tb <- tibble(scale = c(1:10)) %>% 
+  mutate(grid = map(scale, function(x){
+    aggregate(env_stack[["DEPTH"]], fact = 2*x) %>% 
+      st_make_grid(., square = TRUE, cellsize = c(500*2*x, 500*2*x)) %>%
+      cbind(data.frame(ID = sprintf(paste("GID%0",nchar(length(.)),"d",sep=""), 1:length(.)))) %>%
+      st_sf()
+  }))
+
+# identify each krill data point based on th 5 km grid cell it is in (and year/month)
+vmigration_tb <- vmigration_tb %>% 
+  mutate(mean_NASC_cell = map(grid, function(x) {
+    sum_sf %>% 
+      st_join(x, join = st_intersects) %>% 
+      mutate(year_month = substr(Date_M, 1, 6)) %>% 
+      mutate(year_month = ifelse(year_month == 201904, 201905, year_month)) %>% # beware of April 2019 should be counted with the May cruise
+      group_by(year_month, habitat, ID, phase) %>% 
+      summarize(mean_NASC = mean(NASC),
+            max_NASC = max(NASC))
+  }))
+
+# select when day and night data are available within 5 km of each other and during the same cruise
+vmigration_tb <- vmigration_tb %>% 
+  mutate(daynight_diff = map(mean_NASC_cell, function(x) {
+            ddply(x, .(year_month, habitat, ID), function(d){
+              if(nrow(d) == 2) # if both day and night were sampled in this grid cell over this month
+                return(cbind(d[1, c("year_month", "habitat", "ID", "geometry")], 
+                  data.frame(mean_NASC_day = d[d$phase == "day", "mean_NASC"][1],
+                     mean_NASC_night = d[d$phase == "night", "mean_NASC"][1],
+                     max_NASC_day = d[d$phase == "day", "max_NASC"][1],
+                     max_NASC_night = d[d$phase == "night", "max_NASC"][1]))
+                )
+              })
+  }))
+
+save(vmigration_tb, file = "./Outputs/vmigration_tb.RData")
+vmigration_tb
+```
+
+## Magnitude of migration
+```{r, fig.width = 7}
+# calculate the difference in NASC between day and night
+vmigration_mean <- vmigration_tb %>% 
+  mutate(daynight_diff = map(daynight_diff, function(d){
+    d %>% select(-geometry) %>% as_tibble()
+  })) %>% 
+  select(scale, daynight_diff) %>% 
+  unnest(cols = c(daynight_diff)) %>% 
+  mutate(diff_mean = mean_NASC_day - mean_NASC_night,
+         percent_migration = (mean_NASC_day - mean_NASC_night)/ (mean_NASC_day + mean_NASC_night) * 100) %>% 
+  mutate(percent_migration = ifelse(is.nan(percent_migration), 0, percent_migration))
+
+# plot
+g1 <- ggplot(vmigration_mean, aes(as.factor(scale), diff_mean, col = habitat)) +
+  ylab("Day - Night difference in mean NASC within 5km grid cells")
+
+g2 <- ggplot(vmigration_mean, aes(as.factor(scale), percent_migration, col = habitat)) +
+  ylab("% loss from day - night migration \nin mean NASC within 5km grid cells")
+
+(g1+g2) &
+  geom_boxplot()
+
+# summary stats
+vmigration_mean %>% 
+  group_by(habitat) %>% 
+  summarize(nb_cases = n(),
+            `Day - Nigh difference` = mean(diff_mean),
+            `% magnitude of migration` = mean(percent_migration))
+
+vmigration_mean %>% 
+  group_by(year_month) %>% 
+  summarize(nb_cases = n(),
+            `Day - Nigh difference` = mean(diff_mean))
+```
+
+# Krill swarms
+
+## Load echoview exports
+```{r}
+# read csv files
+swarms_df <- list.files("../Data/Exported krill acoustic data_20230428", full.names = T) %>% 
+  keep(~ str_detect(.x, ".regions.") & !str_detect(.x, ".regions-by-cells.")) %>% 
+  ldply(., fread) %>% # trying some data.table functions to speed up the code... and it works damn well
+  data.table()
+
+# remove duplicated rows in case there was some overlap in the echoview export files
+swarms_df <- unique(swarms_df, by = c("Time_M", "Date_M", "Depth_mean")) 
+
+# select columns of interest for a full water column summed analysis
+col <- c("Region_ID","Date_M", "Time_M", "Height_mean", "Depth_mean", "NASC", "Lat_M", "Lon_M")
+swarms_df <- swarms_df[, ..col] %>% 
+  rename("lat" = "Lat_M", "lon" = "Lon_M") # change names of columns for suncalc package to work
+swarms_df
+```
+
+## Day and night
+
+```{r}
+# add date in date format
+swarms_df <- swarms_df[, date := as.Date(as.character(Date_M), format = "%Y%m%d", tz = "GMT")] #add GMT date as Date
+
+# remove abberant lon and lat
+swarms_df <- swarms_df[lon != 999,]
+
+# dataframe is an easier format for suncalc...
+swarms_df <- as.data.frame((swarms_df))
+swarms_df[c("sunrise", "sunset")] <- getSunlightTimes(data = swarms_df[,c("date", "lat", "lon")])[c("sunrise", "sunset")]
+
+# categorize in day and night 1 hour before and after sunset (removing data in twilight)
+swarms_df <- swarms_df %>% 
+  mutate(time_GMT = as.POSIXct(paste(Date_M, Time_M), format = "%Y%m%d %H:%M:%S", tz = "GMT"),
+         phase = case_when(time_GMT > sunrise + 3600 & time_GMT < sunset - 3600 ~ "day",
+                           time_GMT < sunrise - 3600 | time_GMT > sunset + 3600 ~ "night",
+                           (time_GMT >= sunrise - 3600 & time_GMT <= sunrise + 3600) | 
+                           (time_GMT >= sunset - 3600 & time_GMT <= sunset + 3600) ~ "twilight")) %>% 
+  filter(phase != "twilight")
+
+# add year_month
+swarms_df <- swarms_df %>% 
+      mutate(year_month = substr(Date_M, 1, 6)) %>% 
+      mutate(year_month = ifelse(year_month == 201904, 201905, year_month)) # beware of April 2019 should be counted with the May cruise
+```
+
+## Topography
+```{r}
+swarms_df <- swarms_df %>% 
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) %>% 
+  st_transform(crs = 32610) %>% 
+  cbind(., raster::extract(x = env_stack, y =.))
+swarms_df
+
+swarms_df <- swarms_df %>% 
+  st_join(iso1500_sf, join = st_intersects) %>% 
+  mutate(habitat = case_when(FID == 0 & DEPTH >= -200 ~ "shelf", 
+                             FID == 0 & DEPTH < -200 ~ "slope",
+                             is.na(FID) ~ "open ocean")) %>% 
+  dplyr::select(-FID)
+```
+
+## Explore distribution
+
+Get a rough estimate of the effort distribution by pulling points from sum_sf
+```{r}
+# get effort distribution
+effort_echo_sf <- sum_sf %>%  
+      mutate(year_month = substr(Date_M, 1, 6)) %>% 
+      mutate(year_month = ifelse(year_month == 201904, 201905, year_month)) %>% 
+      select(Date_M, Time_M, year_month, DEPTH) %>% 
+      slice(seq(1, n(), 10))
+
+# look at habitat distribution of the effort
+effort_echo_sf <- effort_echo_sf %>% 
+  st_join(iso1500_sf, join = st_intersects) %>% 
+  mutate(habitat = case_when(FID == 0 & DEPTH >= -200 ~ "shelf", 
+                             FID == 0 & DEPTH < -200 ~ "slope",
+                             is.na(FID) ~ "open ocean")) %>% 
+  dplyr::select(-FID)
+```
+
+Encounter rate of swarms per habitat type
+```{r}
+table(swarms_df$habitat) / table(effort_echo_sf$habitat) *10
+```
+Overall swarm distribution
+```{r, fig.width = 8, fig.height = 11}
+g <- ggplot() +
+    geom_sf(data = iso_sf[iso_sf$g_2020_ %in% c(-50, -100, -500, -1000, -1500), ], col = "grey90", linewidth = 0.2) +
+    geom_sf(data = coast_sf, col = NA, fill = "grey15") +
+    geom_sf(data = effort_echo_sf, col = "grey40", size = 0.8) +
+    geom_sf(data = swarms_df, aes(color = Depth_mean, geometry = geometry, size = NASC + 0.1), shape = 19, alpha = 0.8) +
+    scale_color_viridis(name = "Swarm depth", direction = -1) +
+    scale_size(name = "Mean NASC", trans = "log") +
+    mon_theme +
+    theme(axis.text.y = element_text(angle = 90, hjust = 0.5),
+        plot.margin = unit(c(0.05, 0.05, 0.05, 0.05), "cm"),
+        strip.background = element_rect(fill = "white", colour = "black"),
+        legend.key= element_rect(fill = "transparent")) +
+    xlab("") + ylab("") +
+    coord_sf(xlim = c(-129, -122.3), ylim = c(37.5, 48.4), expand = F)
+g
+ggsave(g, file = "./Outputs/krill_swarms_distribution.png", width = 150, height = 220, units = "mm", dpi = 600)
+```
+
+Swarm distribution per cruise
+```{r, fig.width = 15}
+g <- ggplot() +
+    geom_sf(data = iso_sf[iso_sf$g_2020_ %in% c(-50, -100, -500, -1000, -1500), ], col = "grey90", linewidth = 0.2) +
+    geom_sf(data = coast_sf, col = NA, fill = "grey15") +
+    geom_sf(data = effort_echo_sf, col = "grey40", size = 0.8) +
+    geom_sf(data = swarms_df, aes(color = Depth_mean, geometry = geometry, size = NASC + 0.1), shape = 19, alpha = 0.8) +
+    scale_color_viridis(name = "Swarm depth", direction = -1) +
+    scale_size(name = "Mean NASC", trans = "log") +
+    mon_theme +
+    theme(axis.text.y = element_text(angle = 90, hjust = 0.5),
+        plot.margin = unit(c(0.05, 0.05, 0.05, 0.05), "cm"),
+        strip.background = element_rect(fill = "white", colour = "black"),
+        legend.key= element_rect(fill = "transparent"),
+        legend.position = "bottom") +
+    xlab("") + ylab("") +
+    facet_wrap(~year_month, ncol = 9) +
+    coord_sf(xlim = c(-129, -122.3), ylim = c(37.5, 48.4), expand = F)
+g
+ggsave(g, file = "./Outputs/krill_swarms_distribution_bycruise.png", width = 410, height = 130, units = "mm", dpi = 600)
+```
+
+Swarm distribution per cruise and color coded by NASC
+```{r, fig.width = 15}
+g <- ggplot() +
+    geom_sf(data = iso_sf[iso_sf$g_2020_ %in% c(-50, -100, -500, -1000, -1500), ], col = "grey90", linewidth = 0.2) +
+    geom_sf(data = coast_sf, col = NA, fill = "grey15") +
+    geom_sf(data = effort_echo_sf, col = "grey40", size = 0.8) +
+    geom_sf(data = swarms_df, aes(geometry = geometry, color = log(NASC + 0.1)), shape = 19, alpha = 0.8) +
+    scale_color_viridis(name = "Swarm NASC", direction = -1, option = "plasma") +
+    mon_theme +
+    theme(axis.text.y = element_text(angle = 90, hjust = 0.5),
+        plot.margin = unit(c(0.05, 0.05, 0.05, 0.05), "cm"),
+        strip.background = element_rect(fill = "white", colour = "black"),
+        legend.key= element_rect(fill = "transparent"),
+        legend.position = "bottom") +
+    xlab("") + ylab("") +
+    facet_wrap(~year_month, ncol = 9) +
+    coord_sf(xlim = c(-129, -122.3), ylim = c(37.5, 48.4), expand = F)
+g
+ggsave(g, file = "./Outputs/krill_swarms_NASC_bycruise.png", width = 410, height = 130, units = "mm", dpi = 600)
+```
+
+# Output clean up
+
+```{r}
+# remove data collected in inland waters (strait of Juan de Fuca)
+points_to_remove <- sum_sf %>% 
+  st_intersects(coast_simplified, sparse = T)
+
+# how many to remove?
+length(which((apply(points_to_remove, 1, any))))
+
+# do it!
+krill_df <- sum_sf[!(apply(points_to_remove, 1, any)),] 
+
+# save object for next steps
+save(krill_df, file = "./Outputs/krill_df.RData")
+```
+
+Same for swarms
+```{r}
+# remove data collected in inland waters (strait of Juan de Fuca)
+points_to_remove <- swarms_df %>% 
+  st_intersects(coast_simplified, sparse = T)
+
+# how many to remove?
+length(which((apply(points_to_remove, 1, any))))
+
+# do it!
+swarms_df <- swarms_df[!(apply(points_to_remove, 1, any)),] 
+save(swarms_df, file = "./Outputs/swarms_df.RData")
+```
+
+
+# Exploratory model
+```{r, eval = T}
+d <- subset(krill_df, phase == "day") %>% 
+  as.data.frame() %>% 
+  select(-geometry) %>% 
+  mutate(lognasc = log(NASC+1))
+
+m <- gam(lognasc ~ s(DEPTH, k = 5) + 
+           s(SLOPE, k = 5) + 
+           s(DIS_CANYON, k = 5),
+         select = T,
+         method = "REML",
+         family = nb(),
+         data = d)
+save(m, file = "./Outputs/krill_model_test2.RData") # test 1 had no constraints on k and had habitat as a covariate
+```
+
+```{r, eval = T, fig.width = 10}
+load("./Outputs/krill_model_test2.RData")
+summary(m)
+draw(m) & mon_theme
+
+#ggplot(parametric_effects(m), aes(value, partial)) +
+  #geom_point(size = 2) +
+  #geom_errorbar(aes(ymin = partial - se, ymax = partial + se))
+```
